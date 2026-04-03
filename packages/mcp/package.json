@@ -8,8 +8,13 @@
     "build": "tsc",
     "test": "vitest run"
   },
+  "bin": {
+    "weave-mcp": "dist/index.js"
+  },
   "dependencies": {
     "@weave/core": "^0.1.0",
-    "@modelcontextprotocol/sdk": "^1.0.0"
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "yaml": "^2.7.0",
+    "zod": "^4.0.0"
   }
 }

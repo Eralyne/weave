@@ -15,7 +15,7 @@
     "tree-sitter-typescript": "^0.23.0",
     "tree-sitter-php": "^0.23.0",
     "tree-sitter-python": "^0.23.0",
-    "tree-sitter-vue": "^0.3.0",
+    "tree-sitter-vue": "^0.2.0",
     "yaml": "^2.7.0",
     "glob": "^11.0.0"
   },

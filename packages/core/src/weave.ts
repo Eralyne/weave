@@ -9,6 +9,7 @@ import { ConventionValidator } from './conventions/validator.js';
 import { FileWatcher } from './cache/watcher.js';
 import type {
   WeaveConfig,
+  WeaveNode,
   SubgraphQuery,
   SubgraphResult,
   ValidationViolation,
@@ -65,8 +66,20 @@ export class Weave {
   /** Index a single file: extract L1/L2 symbols+edges, then run L3 convention plugins. */
   async indexFile(filePath: string, plugins: ConventionPlugin[]): Promise<void> {
     // L1 + L2: language-level symbols and edges
-    const nodes = this.symbolExtractor.extract(filePath);
-    for (const node of nodes) {
+    const partials = this.symbolExtractor.extract(filePath);
+    for (const partial of partials) {
+      // Symbol extractor returns partials without id — fill defaults for upsert
+      const node: WeaveNode = {
+        id: 0,
+        filePath: partial.filePath ?? filePath,
+        symbolName: partial.symbolName ?? 'unknown',
+        kind: partial.kind ?? 'unknown',
+        language: partial.language ?? this.parser.getLanguage(filePath),
+        lineStart: partial.lineStart ?? 0,
+        lineEnd: partial.lineEnd ?? 0,
+        signature: partial.signature ?? null,
+        metadata: partial.metadata ?? null,
+      };
       this.store.upsertNode(node);
     }
 

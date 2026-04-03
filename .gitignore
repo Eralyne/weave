@@ -6,7 +6,9 @@ dist/
 !jest.config.js
 !vitest.config.ts
 .weave/
+.claude/
 *.db
+SPEC.md
 .DS_Store
 coverage/
 .env
