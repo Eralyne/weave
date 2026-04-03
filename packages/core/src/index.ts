@@ -1,0 +1,11 @@
+export * from './types.js';
+export { GraphStore } from './graph/store.js';
+export { SubgraphExtractor } from './graph/subgraph.js';
+export { TreeSitterParser } from './parser/parser.js';
+export { SymbolExtractor } from './parser/symbols.js';
+export { PluginLoader } from './plugins/loader.js';
+export { PluginRunner } from './plugins/runner.js';
+export { ConventionEngine } from './conventions/engine.js';
+export { ConventionValidator } from './conventions/validator.js';
+export { FileWatcher } from './cache/watcher.js';
+export { Weave } from './weave.js';
