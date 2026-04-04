@@ -34,6 +34,7 @@ export class GraphStore {
   private stmtFindNodesByFilePrefix!: Database.Statement;
   private stmtUpdateNodeMetadata!: Database.Statement;
   private stmtGetNodeByNaturalKey!: Database.Statement;
+  private stmtFindEdgeByNaturalKey!: Database.Statement;
 
   constructor(projectRoot: string) {
     const weaveDir = path.join(projectRoot, '.weave');
@@ -62,7 +63,8 @@ export class GraphStore {
         metadata    TEXT
       );
 
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_natural_key ON nodes(file_path, symbol_name, line_start);
+      DROP INDEX IF EXISTS idx_nodes_natural_key;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_natural_key ON nodes(file_path, symbol_name, kind, line_start);
       CREATE INDEX IF NOT EXISTS idx_nodes_file ON nodes(file_path);
       CREATE INDEX IF NOT EXISTS idx_nodes_kind ON nodes(kind);
       CREATE INDEX IF NOT EXISTS idx_nodes_symbol ON nodes(symbol_name);
@@ -104,11 +106,23 @@ export class GraphStore {
     this.prepareStatements();
   }
 
+  resetGraph(): void {
+    const reset = this.db.transaction(() => {
+      this.db.exec(`
+        DELETE FROM conventions;
+        DELETE FROM edges;
+        DELETE FROM nodes;
+        DELETE FROM file_cache;
+      `);
+    });
+    reset();
+  }
+
   private prepareStatements(): void {
     this.stmtUpsertNode = this.db.prepare(`
       INSERT INTO nodes (file_path, symbol_name, kind, language, line_start, line_end, signature, metadata)
       VALUES (@filePath, @symbolName, @kind, @language, @lineStart, @lineEnd, @signature, @metadata)
-      ON CONFLICT(file_path, symbol_name, line_start) DO UPDATE SET
+      ON CONFLICT(file_path, symbol_name, kind, line_start) DO UPDATE SET
         kind = excluded.kind,
         language = excluded.language,
         line_end = excluded.line_end,
@@ -231,8 +245,19 @@ export class GraphStore {
     );
 
     this.stmtGetNodeByNaturalKey = this.db.prepare(
-      'SELECT * FROM nodes WHERE file_path = ? AND symbol_name = ? AND line_start = ?'
+      'SELECT * FROM nodes WHERE file_path = ? AND symbol_name = ? AND kind = ? AND line_start = ?'
     );
+
+    this.stmtFindEdgeByNaturalKey = this.db.prepare(`
+      SELECT *
+      FROM edges
+      WHERE source_id = @sourceId
+        AND target_id = @targetId
+        AND relationship = @relationship
+        AND layer = @layer
+        AND ((metadata IS NULL AND @metadata IS NULL) OR metadata = @metadata)
+      LIMIT 1
+    `);
   }
 
   upsertNode(node: WeaveNode): WeaveNode {
@@ -250,6 +275,7 @@ export class GraphStore {
     const row = this.stmtGetNodeByNaturalKey.get(
       node.filePath,
       node.symbolName,
+      node.kind,
       node.lineStart,
     ) as RawNodeRow;
     return deserializeNode(row);
@@ -269,13 +295,26 @@ export class GraphStore {
   }
 
   createEdge(edge: Omit<WeaveEdge, 'id'>): WeaveEdge {
+    const metadata = edge.metadata ? JSON.stringify(edge.metadata) : null;
+    const existing = this.stmtFindEdgeByNaturalKey.get({
+      sourceId: edge.sourceId,
+      targetId: edge.targetId,
+      relationship: edge.relationship,
+      layer: edge.layer,
+      metadata,
+    }) as RawEdgeRow | undefined;
+
+    if (existing) {
+      return deserializeEdge(existing);
+    }
+
     const result = this.stmtCreateEdge.run({
       sourceId: edge.sourceId,
       targetId: edge.targetId,
       relationship: edge.relationship,
       layer: edge.layer,
       convention: edge.convention,
-      metadata: edge.metadata ? JSON.stringify(edge.metadata) : null,
+      metadata,
       confidence: edge.confidence,
     });
     return {

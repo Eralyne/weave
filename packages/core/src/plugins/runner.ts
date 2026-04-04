@@ -2,6 +2,7 @@ import { basename } from 'node:path';
 import { minimatch } from 'minimatch';
 import { GraphStore } from '../graph/store.js';
 import { TreeSitterParser } from '../parser/parser.js';
+import { toProjectRelative } from '../path-utils.js';
 import type {
   ConventionPlugin,
   ConventionRule,
@@ -21,10 +22,17 @@ type Captures = Map<string, string>;
 export class PluginRunner {
   private store: GraphStore;
   private parser: TreeSitterParser;
+  private projectRoot: string;
 
-  constructor(store: GraphStore, parser: TreeSitterParser) {
+  constructor(store: GraphStore, parser: TreeSitterParser, projectRoot: string = process.cwd()) {
     this.store = store;
     this.parser = parser;
+    this.projectRoot = projectRoot;
+  }
+
+  /** Relativize an absolute path against the project root. */
+  private relPath(filePath: string): string {
+    return toProjectRelative(this.projectRoot, filePath);
   }
 
   /** Apply all rules from a plugin to a file. */
@@ -36,14 +44,29 @@ export class PluginRunner {
 
   /** Apply a single rule to a file if it matches language and file pattern. */
   private applyRule(filePath: string, rule: ConventionRule, pluginName: string): void {
+    const relativeFilePath = this.relPath(filePath);
     const fileLanguage = this.detectLanguage(filePath);
-    if (fileLanguage !== rule.match.language) return;
+    // Vue SFCs contain TypeScript in <script setup>, so allow typescript rules on .vue files
+    const languageMatches = fileLanguage === rule.match.language
+      || (fileLanguage === 'vue' && rule.match.language === 'typescript');
+    if (!languageMatches) return;
 
     if (rule.match.filePattern) {
-      if (!minimatch(filePath, rule.match.filePattern)) return;
+      if (!minimatch(relativeFilePath, rule.match.filePattern)) return;
     }
 
-    const tree = this.parser.parse(filePath);
+    let tree;
+    let lineOffset = 0;
+    // For Vue files with typescript rules, extract and parse the <script> block as TS
+    if (fileLanguage === 'vue' && rule.match.language === 'typescript') {
+      const source = this.parser.readSource(filePath);
+      const scriptBlock = this.extractVueScriptBlock(source);
+      if (!scriptBlock) return;
+      lineOffset = scriptBlock.startLine;
+      tree = this.parser.parseString(scriptBlock.text, 'typescript');
+    } else {
+      tree = this.parser.parse(filePath);
+    }
     if (!tree) return;
 
     let matches;
@@ -56,17 +79,36 @@ export class PluginRunner {
     if (!matches || matches.length === 0) return;
 
     for (const match of matches) {
-      const captures = this.extractCaptures(match);
-      captures.set('__current_file__', filePath);
+      const captures = this.extractCaptures(match, lineOffset);
+      captures.set('__current_file__', relativeFilePath);
       this.processCreates(filePath, rule.creates, captures, pluginName);
     }
   }
 
   /** Extract named captures from a tree-sitter query match into a string map. */
-  private extractCaptures(match: { captures: Array<{ name: string; node: { text: string } }> }): Captures {
+  private extractCaptures(
+    match: {
+      captures: Array<{
+        name: string;
+        node: { text: string; startPosition?: { row: number } };
+      }>;
+    },
+    lineOffset: number,
+  ): Captures {
     const captures: Captures = new Map();
+    let firstCaptureLine: number | undefined;
     for (const capture of match.captures) {
       captures.set(capture.name, capture.node.text);
+      const captureLine = capture.node.startPosition?.row;
+      if (captureLine !== undefined) {
+        const normalizedLine = captureLine + 1 + lineOffset;
+        if (firstCaptureLine === undefined || normalizedLine < firstCaptureLine) {
+          firstCaptureLine = normalizedLine;
+        }
+      }
+    }
+    if (firstCaptureLine !== undefined) {
+      captures.set('__match_line__', String(firstCaptureLine));
     }
     return captures;
   }
@@ -79,12 +121,20 @@ export class PluginRunner {
     pluginName: string,
   ): void {
     for (const creation of creates) {
+      if ('node' in creation) {
+        this.processNodeCreation(creation.node, captures, pluginName);
+      }
+    }
+
+    for (const creation of creates) {
+      if ('node_metadata' in creation) {
+        this.processNodeMetadataUpdate(filePath, creation.node_metadata, captures);
+      }
+    }
+
+    for (const creation of creates) {
       if ('edge' in creation) {
         this.processEdgeCreation(filePath, creation.edge, captures, pluginName);
-      } else if ('node' in creation) {
-        this.processNodeCreation(creation.node, captures, pluginName);
-      } else if ('node_metadata' in creation) {
-        this.processNodeMetadataUpdate(filePath, creation.node_metadata, captures);
       }
     }
   }
@@ -126,9 +176,10 @@ export class PluginRunner {
     captures: Captures,
     _pluginName: string,
   ): void {
-    const resolvedFile = this.interpolate(nodeSpec.file, captures);
-    const existing = this.store.getNodesByFile(resolvedFile);
-    if (existing.length > 0) return;
+    const resolvedFile = this.relPath(this.interpolate(nodeSpec.file, captures));
+    const existing = this.store.getNodesByFile(resolvedFile)
+      .find(node => node.kind === nodeSpec.kind);
+    if (existing) return;
 
     const symbolName = basename(resolvedFile).replace(/\.[^.]+$/, '');
     this.store.upsertNode({
@@ -152,10 +203,11 @@ export class PluginRunner {
     update: NodeMetadataUpdate,
     captures: Captures,
   ): void {
-    const nodes = this.store.getNodesByFile(filePath)
+    const relativeFilePath = this.relPath(filePath);
+    const nodes = this.store.getNodesByFile(relativeFilePath)
       .filter(n => n.kind === update.kind);
 
-    const resolvedValue = this.interpolate(update.value, captures);
+    const resolvedValue = this.resolveValue(update.value, captures);
 
     for (const node of nodes) {
       const existing = node.metadata ?? {};
@@ -181,26 +233,26 @@ export class PluginRunner {
     // Object with a resolution strategy key
     if ('resolve' in target) {
       return this.resolveFilePath(
-        this.interpolate((target as { resolve: string }).resolve, captures),
+        this.resolveValue((target as { resolve: string }).resolve, captures),
       );
     }
 
     if ('resolve_class' in target) {
       return this.resolveClass(
-        this.interpolate((target as { resolve_class: string }).resolve_class, captures),
+        this.resolveValue((target as { resolve_class: string }).resolve_class, captures),
       );
     }
 
     if ('resolve_import' in target) {
       return this.resolveImport(
-        this.interpolate((target as { resolve_import: string }).resolve_import, captures),
+        this.resolveValue((target as { resolve_import: string }).resolve_import, captures),
         filePath,
       );
     }
 
     if ('resolve_migration' in target) {
       return this.resolveMigration(
-        this.interpolate((target as { resolve_migration: string }).resolve_migration, captures),
+        this.resolveValue((target as { resolve_migration: string }).resolve_migration, captures),
       );
     }
 
@@ -235,14 +287,15 @@ export class PluginRunner {
    * find or create the target node.
    */
   private resolveFilePath(resolvedPath: string): WeaveNode[] {
-    const nodes = this.store.getNodesByFile(resolvedPath);
-    if (nodes.length > 0) return nodes;
+    const relResolved = this.relPath(resolvedPath);
+    const nodes = this.store.getNodesByFile(relResolved);
+    if (nodes.length > 0) return this.preferredFileNodes(nodes);
 
     // Create a placeholder node for the resolved file
-    const symbolName = basename(resolvedPath).replace(/\.[^.]+$/, '');
+    const symbolName = basename(relResolved).replace(/\.[^.]+$/, '');
     const node: WeaveNode = {
       id: 0,
-      filePath: resolvedPath,
+      filePath: relResolved,
       symbolName,
       kind: 'file',
       language: this.detectLanguage(resolvedPath),
@@ -261,7 +314,10 @@ export class PluginRunner {
    */
   private resolveClass(className: string): WeaveNode[] {
     const nodes = this.store.findNodeBySymbol(className);
-    if (nodes.length > 0) return nodes;
+    if (nodes.length > 0) {
+      const specialized = nodes.filter(node => node.kind !== 'class' && node.kind !== 'file');
+      return specialized.length > 0 ? specialized : nodes;
+    }
 
     // Search for partial matches (class name might be short name without namespace)
     const allClasses = this.store.getNodesByKind('class');
@@ -271,13 +327,40 @@ export class PluginRunner {
     return match;
   }
 
+  private preferredFileNodes(nodes: WeaveNode[]): WeaveNode[] {
+    const priority = (kind: string): number => {
+      const priorities: Record<string, number> = {
+        inertia_page: 100,
+        action: 95,
+        model: 95,
+        migration: 95,
+        form_request: 95,
+        policy: 95,
+        event: 95,
+        listener: 95,
+        route_definition: 95,
+        composable: 90,
+        component: 85,
+        class: 80,
+        function: 75,
+        file: 10,
+        method: 5,
+        export: 1,
+      };
+      return priorities[kind] ?? 50;
+    };
+
+    const bestPriority = Math.max(...nodes.map(node => priority(node.kind)));
+    return nodes.filter(node => priority(node.kind) === bestPriority);
+  }
+
   /**
    * resolve_import — Follow import chains to find the definition.
    * Looks for import edges from the current file that match the symbol name.
    */
   private resolveImport(symbolName: string, filePath: string): WeaveNode[] {
     // Find import edges from the current file
-    const fileNodes = this.store.getNodesByFile(filePath);
+    const fileNodes = this.store.getNodesByFile(this.relPath(filePath));
     for (const fileNode of fileNodes) {
       const edges = this.store.getEdgesFrom(fileNode.id);
       for (const edge of edges) {
@@ -330,11 +413,21 @@ export class PluginRunner {
   /** current_symbol — The enclosing function/class containing the match. */
   private resolveCurrentSymbol(filePath: string, captures: Captures): WeaveNode[] {
     // The tree-sitter match is within a function/class — find the enclosing symbol
-    const fileNodes = this.store.getNodesByFile(filePath);
+    const fileNodes = this.store.getNodesByFile(this.relPath(filePath));
 
     // Prefer function/method/class nodes (the enclosing symbol)
     const enclosingKinds = ['function', 'method', 'class', 'action', 'model', 'component', 'composable'];
-    const enclosing = fileNodes.filter(n => enclosingKinds.includes(n.kind));
+    const matchLine = Number(captures.get('__match_line__'));
+    const enclosing = fileNodes
+      .filter(n => enclosingKinds.includes(n.kind))
+      .filter(n => !Number.isNaN(matchLine)
+        ? n.lineStart <= matchLine && n.lineEnd >= matchLine
+        : true)
+      .sort((a, b) => {
+        const aRange = a.lineEnd - a.lineStart;
+        const bRange = b.lineEnd - b.lineStart;
+        return aRange - bRange;
+      });
 
     if (enclosing.length > 0) return [enclosing[0]];
 
@@ -346,14 +439,16 @@ export class PluginRunner {
 
   /** current_file — The file being analyzed. */
   private resolveCurrentFile(filePath: string): WeaveNode[] {
-    const nodes = this.store.getNodesByFile(filePath);
-    if (nodes.length > 0) return [nodes[0]];
+    const relFile = this.relPath(filePath);
+    const nodes = this.store.getNodesByFile(relFile);
+    const fileNode = nodes.find(node => node.kind === 'file');
+    if (fileNode) return [fileNode];
 
     // Create a file-level node
-    const symbolName = basename(filePath).replace(/\.[^.]+$/, '');
+    const symbolName = basename(relFile).replace(/\.[^.]+$/, '');
     const node: WeaveNode = {
       id: 0,
-      filePath,
+      filePath: relFile,
       symbolName,
       kind: 'file',
       language: this.detectLanguage(filePath),
@@ -365,6 +460,44 @@ export class PluginRunner {
 
     const created = this.store.upsertNode(node);
     return created ? [created] : [];
+  }
+
+  private extractVueScriptBlock(source: string): { text: string; startLine: number } | null {
+    const lines = source.split('\n');
+    let inScript = false;
+    let isSetupScript = false;
+    let startLine = 0;
+    const scriptLines: string[] = [];
+    let fallback: { text: string; startLine: number } | null = null;
+
+    for (let i = 0; i < lines.length; i++) {
+      const trimmed = lines[i].trim();
+
+      if (!inScript) {
+        const scriptMatch = trimmed.match(/^<script\b([^>]*)>/);
+        if (!scriptMatch) continue;
+
+        inScript = true;
+        isSetupScript = scriptMatch[1].includes('setup');
+        startLine = i;
+        scriptLines.length = 0;
+        continue;
+      }
+
+      if (trimmed === '</script>') {
+        inScript = false;
+        const result = { text: scriptLines.join('\n'), startLine };
+        if (isSetupScript) {
+          return result;
+        }
+        fallback = result;
+        continue;
+      }
+
+      scriptLines.push(lines[i]);
+    }
+
+    return fallback;
   }
 
   /**
@@ -386,15 +519,17 @@ export class PluginRunner {
   ): Record<string, unknown> {
     const result: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(metadata)) {
-      if (value.startsWith('@')) {
-        // Direct capture reference: "@props" -> captures.get("props")
-        const captureName = value.slice(1);
-        result[key] = captures.get(captureName) ?? value;
-      } else {
-        result[key] = this.interpolate(value, captures);
-      }
+      result[key] = this.resolveValue(value, captures);
     }
     return result;
+  }
+
+  private resolveValue(value: string, captures: Captures): string {
+    if (value.startsWith('@')) {
+      const captureName = value.slice(1);
+      return captures.get(captureName) ?? value;
+    }
+    return this.interpolate(value, captures);
   }
 
   /** Detect language from file extension. */

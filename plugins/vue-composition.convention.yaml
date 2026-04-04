@@ -99,7 +99,7 @@ rules:
         (import_statement
           (import_clause
             (identifier) @component_name)
-          source: (string (string_content) @source
+          source: (string (string_fragment) @source
             (#match? @source "\\.vue$")))
     creates:
       - edge:
@@ -117,7 +117,7 @@ rules:
         (call_expression
           function: (identifier) @fn (#eq? @fn "provide")
           arguments: (arguments
-            (string (string_content) @key)))
+            (string (string_fragment) @key)))
     creates:
       - edge:
           from: current_symbol

@@ -60,6 +60,10 @@ export class ConventionEngine {
    * Get derived conventions, optionally filtered by kind.
    */
   getConventions(kind?: string): Convention[] {
+    if (this.conventionsCache.length === 0) {
+      this.conventionsCache = this.store.getConventions();
+    }
+
     if (kind) {
       return this.conventionsCache.filter(c => c.kind === kind);
     }

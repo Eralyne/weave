@@ -25,14 +25,17 @@ rules:
       language: php
       file_pattern: "routes/*.php"
       pattern: |
-        (member_call_expression
+        (scoped_call_expression
+          scope: (name) @_route (#eq? @_route "Route")
           name: (name) @method (#match? @method "^(get|post|put|patch|delete|any|match)$")
           arguments: (arguments
-            (string (string_content) @path)
-            (array_creation_expression
-              (array_element_initializer
-                (class_constant_access_expression
-                  (name) @class_name)))))
+            (argument
+              (string (string_content) @path))
+            (argument
+              (array_creation_expression
+                (array_element_initializer
+                  (class_constant_access_expression
+                    (name) @class_name))))))
     creates:
       - edge:
           from: current_file
@@ -49,16 +52,18 @@ rules:
       language: php
       file_pattern: "routes/*.php"
       pattern: |
-        (member_call_expression
+        (scoped_call_expression
+          scope: (name) @_route (#eq? @_route "Route")
           name: (name) @method (#eq? @method "group")
           arguments: (arguments
-            (array_creation_expression
-              (array_element_initializer
-                (string (string_content) @key (#eq? @key "prefix"))
-                (string (string_content) @prefix_value)))))
+            (argument
+              (array_creation_expression
+                (array_element_initializer
+                  (string (string_content) @key (#eq? @key "prefix"))
+                  (string (string_content) @prefix_value))))))
     creates:
       - node:
-          file: "routes/{current_file}"
+          file: "{current_file}"
           kind: route_definition
           metadata:
             prefix: "@prefix_value"
@@ -70,12 +75,13 @@ rules:
       file_pattern: "app/Models/*.php"
       pattern: |
         (member_call_expression
-          object: (variable) @obj (#eq? @obj "$this")
+          object: (variable_name) @obj (#eq? @obj "$this")
           name: (name) @method (#eq? @method "hasMany")
           arguments: (arguments
-            (class_constant_access_expression
-              (name) @related_model
-              (name) @const (#eq? @const "class"))))
+            (argument
+              (class_constant_access_expression
+                (name) @related_model
+                (name) @_const (#eq? @_const "class")))))
     creates:
       - edge:
           from: current_symbol
@@ -90,12 +96,13 @@ rules:
       file_pattern: "app/Models/*.php"
       pattern: |
         (member_call_expression
-          object: (variable) @obj (#eq? @obj "$this")
+          object: (variable_name) @obj (#eq? @obj "$this")
           name: (name) @method (#eq? @method "belongsTo")
           arguments: (arguments
-            (class_constant_access_expression
-              (name) @related_model
-              (name) @const (#eq? @const "class"))))
+            (argument
+              (class_constant_access_expression
+                (name) @related_model
+                (name) @_const (#eq? @_const "class")))))
     creates:
       - edge:
           from: current_symbol
@@ -110,12 +117,13 @@ rules:
       file_pattern: "app/Models/*.php"
       pattern: |
         (member_call_expression
-          object: (variable) @obj (#eq? @obj "$this")
+          object: (variable_name) @obj (#eq? @obj "$this")
           name: (name) @method (#eq? @method "hasOne")
           arguments: (arguments
-            (class_constant_access_expression
-              (name) @related_model
-              (name) @const (#eq? @const "class"))))
+            (argument
+              (class_constant_access_expression
+                (name) @related_model
+                (name) @_const (#eq? @_const "class")))))
     creates:
       - edge:
           from: current_symbol
@@ -130,12 +138,13 @@ rules:
       file_pattern: "app/Models/*.php"
       pattern: |
         (member_call_expression
-          object: (variable) @obj (#eq? @obj "$this")
+          object: (variable_name) @obj (#eq? @obj "$this")
           name: (name) @method (#eq? @method "belongsToMany")
           arguments: (arguments
-            (class_constant_access_expression
-              (name) @related_model
-              (name) @const (#eq? @const "class"))))
+            (argument
+              (class_constant_access_expression
+                (name) @related_model
+                (name) @_const (#eq? @_const "class")))))
     creates:
       - edge:
           from: current_symbol
@@ -150,12 +159,13 @@ rules:
       file_pattern: "app/Models/*.php"
       pattern: |
         (member_call_expression
-          object: (variable) @obj (#eq? @obj "$this")
+          object: (variable_name) @obj (#eq? @obj "$this")
           name: (name) @method (#eq? @method "morphMany")
           arguments: (arguments
-            (class_constant_access_expression
-              (name) @related_model
-              (name) @const (#eq? @const "class"))))
+            (argument
+              (class_constant_access_expression
+                (name) @related_model
+                (name) @_const (#eq? @_const "class")))))
     creates:
       - edge:
           from: current_symbol
@@ -171,8 +181,8 @@ rules:
       pattern: |
         (property_declaration
           (property_element
-            (variable_name) @var (#eq? @var "$table")
-            (string (string_content) @table_name)))
+            name: (variable_name) @var (#eq? @var "$table")
+            default_value: (string (string_content) @table_name)))
     creates:
       - edge:
           from: current_symbol
@@ -201,10 +211,9 @@ rules:
     match:
       language: php
       pattern: |
-        (member_call_expression
-          name: (name) @method (#eq? @method "dispatch")
-          object: (class_constant_access_expression
-            (name) @event_class))
+        (scoped_call_expression
+          scope: (name) @event_class
+          name: (name) @method (#eq? @method "dispatch"))
     creates:
       - edge:
           from: current_symbol

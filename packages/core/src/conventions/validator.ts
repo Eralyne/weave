@@ -1,4 +1,5 @@
 import { ConventionEngine } from './engine.js';
+import { toProjectRelative } from '../path-utils.js';
 import type {
   Convention,
   ValidationViolation,
@@ -16,11 +17,13 @@ export class ConventionValidator {
   private engine: ConventionEngine;
   private config: WeaveConfig;
   private store: GraphStore;
+  private projectRoot: string;
 
-  constructor(engine: ConventionEngine, config: WeaveConfig) {
+  constructor(engine: ConventionEngine, config: WeaveConfig, projectRoot: string) {
     this.engine = engine;
     this.config = config;
     this.store = engine.store;
+    this.projectRoot = projectRoot;
   }
 
   /**
@@ -31,10 +34,11 @@ export class ConventionValidator {
     const violations: ValidationViolation[] = [];
 
     for (const filePath of filePaths) {
-      const fileNodes = this.store.getNodesByFile(filePath);
+      const relativePath = toProjectRelative(this.projectRoot, filePath);
+      const fileNodes = this.store.getNodesByFile(relativePath);
       if (fileNodes.length === 0) continue;
 
-      const fileViolations = this.validateNodes(filePath, fileNodes);
+      const fileViolations = this.validateNodes(relativePath, fileNodes);
       violations.push(...fileViolations);
     }
 

@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import type { GraphStore } from './store.js';
+import { toProjectAbsolute, toProjectRelative } from '../path-utils.js';
 import type {
   SubgraphQuery,
   SubgraphResult,
@@ -23,7 +24,10 @@ const ESTIMATED_TOKENS_PER_NODE = 60;
 const ESTIMATED_TOKENS_PER_SNIPPET_LINE = 4;
 
 export class SubgraphExtractor {
-  constructor(private store: GraphStore) {}
+  constructor(
+    private store: GraphStore,
+    private projectRoot: string,
+  ) {}
 
   extract(query: SubgraphQuery): SubgraphResult {
     const depth = query.depth ?? DEFAULT_DEPTH;
@@ -101,18 +105,20 @@ export class SubgraphExtractor {
   }
 
   private resolveStart(fileOrSymbol: string): WeaveNode[] {
-    const nodesByFile = this.store.getNodesByFile(fileOrSymbol);
+    const normalizedInput = toProjectRelative(this.projectRoot, fileOrSymbol);
+
+    const nodesByFile = this.store.getNodesByFile(normalizedInput);
     if (nodesByFile.length > 0) {
       return nodesByFile;
     }
 
-    let symbolName = fileOrSymbol;
+    let symbolName = normalizedInput;
     let kind: string | undefined;
 
-    const colonIndex = fileOrSymbol.indexOf(':');
+    const colonIndex = normalizedInput.indexOf(':');
     if (colonIndex !== -1) {
-      symbolName = fileOrSymbol.substring(colonIndex + 1);
-      const prefix = fileOrSymbol.substring(0, colonIndex);
+      symbolName = normalizedInput.substring(colonIndex + 1);
+      const prefix = normalizedInput.substring(0, colonIndex);
       const fileNodes = this.store.getNodesByFile(prefix);
       if (fileNodes.length > 0) {
         const matched = fileNodes.filter(n => n.symbolName === symbolName);
@@ -290,7 +296,7 @@ export class SubgraphExtractor {
 
   private readSnippet(filePath: string, lineStart: number, lineEnd: number): string | undefined {
     try {
-      const content = fs.readFileSync(filePath, 'utf-8');
+      const content = fs.readFileSync(toProjectAbsolute(this.projectRoot, filePath), 'utf-8');
       const lines = content.split('\n');
       const startIdx = Math.max(0, lineStart - 1);
       const endIdx = Math.min(lines.length, lineEnd);

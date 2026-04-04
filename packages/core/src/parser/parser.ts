@@ -55,14 +55,15 @@ export class TreeSitterParser {
   parse(filePath: string): Parser.Tree {
     const stat = statSync(filePath);
     const mtime = stat.mtimeMs;
+    const language = this.getLanguage(filePath);
+    const grammar = this.loadGrammar(language);
 
     const cached = this.cache.get(filePath);
     if (cached && cached.mtime === mtime) {
+      this.parser.setLanguage(grammar);
       return cached.tree;
     }
 
-    const language = this.getLanguage(filePath);
-    const grammar = this.loadGrammar(language);
     this.parser.setLanguage(grammar);
 
     const source = readFileSync(filePath, 'utf-8');

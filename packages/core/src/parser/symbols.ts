@@ -84,6 +84,7 @@ export class SymbolExtractor {
           this.extractPhpClass(filePath, child, source, namespace, nodes, edges);
           break;
         case 'use_declaration':
+        case 'namespace_use_declaration':
           this.extractPhpUse(filePath, child, edges);
           break;
         default:
@@ -111,6 +112,7 @@ export class SymbolExtractor {
           this.extractPhpClass(filePath, child, source, namespace, nodes, edges);
           break;
         case 'use_declaration':
+        case 'namespace_use_declaration':
           this.extractPhpUse(filePath, child, edges);
           break;
         default:
@@ -155,7 +157,8 @@ export class SymbolExtractor {
     const methods: string[] = [];
 
     // Check for extends
-    const baseClause = node.childForFieldName('base_clause');
+    const baseClause = node.childForFieldName('base_clause')
+      ?? node.children.find(child => child.type === 'base_clause');
     if (baseClause) {
       const baseName = baseClause.children.find(c => c.type === 'name' || c.type === 'qualified_name');
       if (baseName) {
@@ -223,7 +226,12 @@ export class SymbolExtractor {
   ): void {
     // use_declaration can contain one or more use_clause children
     for (const child of node.children) {
-      if (child.type === 'use_clause' || child.type === 'qualified_name' || child.type === 'name') {
+      if (
+        child.type === 'use_clause'
+        || child.type === 'namespace_use_clause'
+        || child.type === 'qualified_name'
+        || child.type === 'name'
+      ) {
         const fullName = child.text;
         edges.push({
           sourceId: 0,
@@ -938,8 +946,15 @@ export class SymbolExtractor {
     edges: Partial<WeaveEdge>[],
   ): void {
     this.walkNode(node, (child) => {
-      if (child.type === 'call_expression' || child.type === 'function_call_expression') {
-        const callee = child.childForFieldName('function') ?? child.childForFieldName('name');
+      if (
+        child.type === 'call_expression'
+        || child.type === 'function_call_expression'
+        || child.type === 'member_call_expression'
+        || child.type === 'scoped_call_expression'
+      ) {
+        const callee = child.type === 'member_call_expression' || child.type === 'scoped_call_expression'
+          ? child
+          : child.childForFieldName('function') ?? child.childForFieldName('name');
         if (callee) {
           const calleeName = this.resolveCalleeName(callee);
           if (calleeName && calleeName !== callerName) {

@@ -4,24 +4,18 @@ import { readFileSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { Weave } from '@weave/core';
 import type { WeaveConfig } from '@weave/core';
+import { parse as parseYaml } from 'yaml';
 
 function loadConfig(projectRoot: string): Partial<WeaveConfig> {
   const configPath = resolve(projectRoot, '.weave', 'config.yaml');
   if (!existsSync(configPath)) return {};
 
-  // Minimal YAML parsing for flat config keys.
-  // A full YAML parser (js-yaml) is not in deps — parse the subset we need.
-  const raw = readFileSync(configPath, 'utf-8');
-  const config: Partial<WeaveConfig> = {};
-
-  if (/^monorepo:\s*true/m.test(raw)) config.monorepo = true;
-
-  const pluginLines = raw.match(/^plugins:\s*\n((?:\s+-\s+.+\n?)*)/m);
-  if (pluginLines) {
-    config.plugins = [...pluginLines[1].matchAll(/^\s+-\s+(.+)/gm)].map(m => m[1].trim());
+  try {
+    const raw = readFileSync(configPath, 'utf-8');
+    return parseYaml(raw) as Partial<WeaveConfig>;
+  } catch {
+    return {};
   }
-
-  return config;
 }
 
 function createWeave(): Weave {

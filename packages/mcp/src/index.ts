@@ -126,18 +126,14 @@ server.tool(
   async ({ kind, contextNodeId }) => {
     try {
       await ensureInit();
-      const conventions = weave.conventions(kind);
-      const withExemplar = conventions.find((c: { exemplarId: number | null }) => c.exemplarId != null);
-      if (!withExemplar) {
+      const exemplar = weave.exemplar(kind, contextNodeId);
+      if (!exemplar) {
         return jsonResult({ kind, exemplar: null, message: `No exemplar found for kind "${kind}"` });
       }
       return jsonResult({
         kind,
-        conventionProperty: withExemplar.property,
-        confidence: withExemplar.confidence,
-        exemplarId: withExemplar.exemplarId,
+        exemplar,
         contextNodeId: contextNodeId ?? null,
-        metadata: withExemplar.metadata,
       });
     } catch (error) {
       return errorResult(error);

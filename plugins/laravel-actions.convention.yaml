@@ -18,13 +18,16 @@ rules:
       language: php
       file_pattern: "routes/*.php"
       pattern: |
-        (member_call_expression
+        (scoped_call_expression
+          scope: (name) @_route (#eq? @_route "Route")
           name: (name) @method (#match? @method "^(get|post|put|patch|delete|any|match)$")
           arguments: (arguments
-            (string (string_content) @path)
-            (class_constant_access_expression
-              (name) @action_class
-              (name) @const (#eq? @const "class"))))
+            (argument
+              (string (string_content) @path))
+            (argument
+              (class_constant_access_expression
+                (name) @action_class
+                (name) @_const (#eq? @_const "class")))))
     creates:
       - edge:
           from: current_file
@@ -34,9 +37,6 @@ rules:
           metadata:
             method: "@method"
             path: "@path"
-      - node:
-          file: "app/Actions/{@action_class}.php"
-          kind: action
 
   - name: action-as-object-trait
     description: Detect classes using AsAction trait

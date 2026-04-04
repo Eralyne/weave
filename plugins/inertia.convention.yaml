@@ -19,12 +19,15 @@ rules:
     match:
       language: php
       pattern: |
-        (member_call_expression
-          object: (name) @obj (#eq? @obj "Inertia")
+        (scoped_call_expression
+          scope: (name) @obj (#eq? @obj "Inertia")
           name: (name) @method (#eq? @method "render")
           arguments: (arguments
-            (string (string_content) @component)
-            (array_creation_expression)? @props))
+            (argument
+              [(string (string_content) @component)
+               (encapsed_string (string_content) @component)])
+            (argument
+              (array_creation_expression)? @props)))
     creates:
       - edge:
           from: current_symbol
@@ -45,8 +48,11 @@ rules:
         (function_call_expression
           function: (name) @fn (#eq? @fn "inertia")
           arguments: (arguments
-            (string (string_content) @component)
-            (array_creation_expression)? @props))
+            (argument
+              [(string (string_content) @component)
+               (encapsed_string (string_content) @component)])
+            (argument
+              (array_creation_expression)? @props)))
     creates:
       - edge:
           from: current_symbol
@@ -64,11 +70,13 @@ rules:
     match:
       language: php
       pattern: |
-        (member_call_expression
-          object: (name) @obj (#eq? @obj "Inertia")
+        (scoped_call_expression
+          scope: (name) @obj (#eq? @obj "Inertia")
           name: (name) @method (#eq? @method "share")
           arguments: (arguments
-            (string (string_content) @key)))
+            (argument
+              [(string (string_content) @key)
+               (encapsed_string (string_content) @key)])))
     creates:
       - edge:
           from: current_symbol
@@ -104,7 +112,7 @@ rules:
             object: (identifier) @obj (#eq? @obj "router")
             property: (property_identifier) @method (#match? @method "^(visit|get|post|put|patch|delete)$"))
           arguments: (arguments
-            (string (string_content) @route_path)))
+            (string (string_fragment) @route_path)))
     creates:
       - edge:
           from: current_symbol
