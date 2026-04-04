@@ -1,0 +1,128 @@
+name: vue-composition
+version: 1.0.0
+description: Vue 3 Composition API — composables, props, emits, component relationships
+
+detect:
+  files:
+    - package.json
+  contains:
+    package.json: "\"vue\""
+
+node_kinds:
+  - component
+  - composable
+
+rules:
+  - name: composable-usage
+    description: Tracks which components use which composables
+    match:
+      language: typescript
+      file_pattern: "**/*.vue"
+      pattern: |
+        (call_expression
+          function: (identifier) @fn
+          (#match? @fn "^use[A-Z]"))
+    creates:
+      - edge:
+          from: current_symbol
+          to:
+            resolve_import: "@fn"
+          relationship: uses_composable
+
+  - name: composable-definition
+    description: Detects composable function definitions
+    match:
+      language: typescript
+      file_pattern: "**/composables/**/*.ts"
+      pattern: |
+        (export_statement
+          (function_declaration
+            name: (identifier) @fn
+            (#match? @fn "^use[A-Z]")))
+    creates:
+      - node:
+          file: "{current_file}"
+          kind: composable
+
+  - name: composable-arrow-definition
+    description: Detects arrow-function composable exports
+    match:
+      language: typescript
+      file_pattern: "**/composables/**/*.ts"
+      pattern: |
+        (export_statement
+          (lexical_declaration
+            (variable_declarator
+              name: (identifier) @fn
+              (#match? @fn "^use[A-Z]"))))
+    creates:
+      - node:
+          file: "{current_file}"
+          kind: composable
+
+  - name: define-props
+    description: Tracks prop contracts on components
+    match:
+      language: typescript
+      file_pattern: "**/*.vue"
+      pattern: |
+        (call_expression
+          function: (identifier) @fn (#eq? @fn "defineProps")
+          arguments: (arguments (_) @props_shape))
+    creates:
+      - node_metadata:
+          kind: component
+          key: props
+          value: "@props_shape"
+
+  - name: define-emits
+    description: Tracks emit contracts on components
+    match:
+      language: typescript
+      file_pattern: "**/*.vue"
+      pattern: |
+        (call_expression
+          function: (identifier) @fn (#eq? @fn "defineEmits")
+          arguments: (arguments (_) @emits_shape))
+    creates:
+      - node_metadata:
+          kind: component
+          key: emits
+          value: "@emits_shape"
+
+  - name: component-import
+    description: Tracks parent-child component relationships via imports
+    match:
+      language: typescript
+      file_pattern: "**/*.vue"
+      pattern: |
+        (import_statement
+          (import_clause
+            (identifier) @component_name)
+          source: (string (string_content) @source
+            (#match? @source "\\.vue$")))
+    creates:
+      - edge:
+          from: current_file
+          to:
+            resolve_import: "@component_name"
+          relationship: renders_child
+
+  - name: provide-inject
+    description: Tracks provide/inject dependency chains
+    match:
+      language: typescript
+      file_pattern: "**/*.vue"
+      pattern: |
+        (call_expression
+          function: (identifier) @fn (#eq? @fn "provide")
+          arguments: (arguments
+            (string (string_content) @key)))
+    creates:
+      - edge:
+          from: current_symbol
+          to:
+            all_of_kind: component
+          relationship: provides
+          metadata:
+            key: "@key"

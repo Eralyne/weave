@@ -1,0 +1,255 @@
+name: laravel-core
+version: 1.0.0
+description: Laravel core framework conventions — models, migrations, routes, events, policies, form requests
+
+detect:
+  files:
+    - artisan
+    - composer.json
+  contains:
+    composer.json: "laravel/framework"
+
+node_kinds:
+  - model
+  - migration
+  - form_request
+  - policy
+  - event
+  - listener
+  - route_definition
+
+rules:
+  - name: route-controller
+    description: Route definitions linking URLs to controller classes
+    match:
+      language: php
+      file_pattern: "routes/*.php"
+      pattern: |
+        (member_call_expression
+          name: (name) @method (#match? @method "^(get|post|put|patch|delete|any|match)$")
+          arguments: (arguments
+            (string (string_content) @path)
+            (array_creation_expression
+              (array_element_initializer
+                (class_constant_access_expression
+                  (name) @class_name)))))
+    creates:
+      - edge:
+          from: current_file
+          to:
+            resolve_class: "@class_name"
+          relationship: routes_to
+          metadata:
+            method: "@method"
+            path: "@path"
+
+  - name: route-closure-group
+    description: Route group prefixes
+    match:
+      language: php
+      file_pattern: "routes/*.php"
+      pattern: |
+        (member_call_expression
+          name: (name) @method (#eq? @method "group")
+          arguments: (arguments
+            (array_creation_expression
+              (array_element_initializer
+                (string (string_content) @key (#eq? @key "prefix"))
+                (string (string_content) @prefix_value)))))
+    creates:
+      - node:
+          file: "routes/{current_file}"
+          kind: route_definition
+          metadata:
+            prefix: "@prefix_value"
+
+  - name: eloquent-has-many
+    description: Eloquent hasMany relationship linking models
+    match:
+      language: php
+      file_pattern: "app/Models/*.php"
+      pattern: |
+        (member_call_expression
+          object: (variable) @obj (#eq? @obj "$this")
+          name: (name) @method (#eq? @method "hasMany")
+          arguments: (arguments
+            (class_constant_access_expression
+              (name) @related_model
+              (name) @const (#eq? @const "class"))))
+    creates:
+      - edge:
+          from: current_symbol
+          to:
+            resolve_class: "@related_model"
+          relationship: has_many
+
+  - name: eloquent-belongs-to
+    description: Eloquent belongsTo relationship
+    match:
+      language: php
+      file_pattern: "app/Models/*.php"
+      pattern: |
+        (member_call_expression
+          object: (variable) @obj (#eq? @obj "$this")
+          name: (name) @method (#eq? @method "belongsTo")
+          arguments: (arguments
+            (class_constant_access_expression
+              (name) @related_model
+              (name) @const (#eq? @const "class"))))
+    creates:
+      - edge:
+          from: current_symbol
+          to:
+            resolve_class: "@related_model"
+          relationship: belongs_to
+
+  - name: eloquent-has-one
+    description: Eloquent hasOne relationship
+    match:
+      language: php
+      file_pattern: "app/Models/*.php"
+      pattern: |
+        (member_call_expression
+          object: (variable) @obj (#eq? @obj "$this")
+          name: (name) @method (#eq? @method "hasOne")
+          arguments: (arguments
+            (class_constant_access_expression
+              (name) @related_model
+              (name) @const (#eq? @const "class"))))
+    creates:
+      - edge:
+          from: current_symbol
+          to:
+            resolve_class: "@related_model"
+          relationship: has_one
+
+  - name: eloquent-belongs-to-many
+    description: Eloquent belongsToMany (pivot) relationship
+    match:
+      language: php
+      file_pattern: "app/Models/*.php"
+      pattern: |
+        (member_call_expression
+          object: (variable) @obj (#eq? @obj "$this")
+          name: (name) @method (#eq? @method "belongsToMany")
+          arguments: (arguments
+            (class_constant_access_expression
+              (name) @related_model
+              (name) @const (#eq? @const "class"))))
+    creates:
+      - edge:
+          from: current_symbol
+          to:
+            resolve_class: "@related_model"
+          relationship: belongs_to_many
+
+  - name: eloquent-morph-many
+    description: Eloquent morphMany polymorphic relationship
+    match:
+      language: php
+      file_pattern: "app/Models/*.php"
+      pattern: |
+        (member_call_expression
+          object: (variable) @obj (#eq? @obj "$this")
+          name: (name) @method (#eq? @method "morphMany")
+          arguments: (arguments
+            (class_constant_access_expression
+              (name) @related_model
+              (name) @const (#eq? @const "class"))))
+    creates:
+      - edge:
+          from: current_symbol
+          to:
+            resolve_class: "@related_model"
+          relationship: morph_many
+
+  - name: model-to-migration
+    description: Links models to their migration files by table name
+    match:
+      language: php
+      file_pattern: "app/Models/*.php"
+      pattern: |
+        (property_declaration
+          (property_element
+            (variable_name) @var (#eq? @var "$table")
+            (string (string_content) @table_name)))
+    creates:
+      - edge:
+          from: current_symbol
+          to:
+            resolve_migration: "@table_name"
+          relationship: migrated_by
+
+  - name: form-request-usage
+    description: Type-hinted FormRequest in method parameters
+    match:
+      language: php
+      pattern: |
+        (formal_parameters
+          (simple_parameter
+            type: (named_type (name) @request_class)
+            (#match? @request_class "Request$")))
+    creates:
+      - edge:
+          from: current_symbol
+          to:
+            resolve_class: "@request_class"
+          relationship: validates_with
+
+  - name: event-dispatch
+    description: Event class dispatching
+    match:
+      language: php
+      pattern: |
+        (member_call_expression
+          name: (name) @method (#eq? @method "dispatch")
+          object: (class_constant_access_expression
+            (name) @event_class))
+    creates:
+      - edge:
+          from: current_symbol
+          to:
+            resolve_class: "@event_class"
+          relationship: dispatches
+
+  - name: event-listener-binding
+    description: Event-to-listener bindings in EventServiceProvider
+    match:
+      language: php
+      file_pattern: "app/Providers/*EventServiceProvider*.php"
+      pattern: |
+        (array_element_initializer
+          (class_constant_access_expression
+            (name) @event_class
+            (name) @c1 (#eq? @c1 "class"))
+          (array_creation_expression
+            (array_element_initializer
+              (class_constant_access_expression
+                (name) @listener_class
+                (name) @c2 (#eq? @c2 "class")))))
+    creates:
+      - edge:
+          from:
+            resolve_class: "@event_class"
+          to:
+            resolve_class: "@listener_class"
+          relationship: handled_by
+
+  - name: policy-authorization
+    description: Policy methods that authorize model operations
+    match:
+      language: php
+      file_pattern: "app/Policies/*.php"
+      pattern: |
+        (method_declaration
+          name: (name) @method_name
+          parameters: (formal_parameters
+            (simple_parameter
+              type: (named_type (name) @model_class)
+              (#not-match? @model_class "^(User|Request)$"))))
+    creates:
+      - edge:
+          from: current_symbol
+          to:
+            resolve_class: "@model_class"
+          relationship: authorizes

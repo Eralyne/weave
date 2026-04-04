@@ -1,6 +1,10 @@
+import { createRequire } from 'node:module';
 import Parser from 'tree-sitter';
 import { readFileSync, statSync } from 'fs';
 import { extname } from 'path';
+
+// Native addons need require() even in ESM
+const require = createRequire(import.meta.url);
 
 interface CacheEntry {
   tree: Parser.Tree;
@@ -82,7 +86,7 @@ export class TreeSitterParser {
    * Run a tree-sitter query pattern against a parsed tree.
    */
   query(tree: Parser.Tree, queryString: string): Parser.QueryMatch[] {
-    const lang = tree.getLanguage();
+    const lang = this.parser.getLanguage() as Parser.Language;
     const query = new Parser.Query(lang, queryString);
     return query.matches(tree.rootNode);
   }

@@ -1,0 +1,28 @@
+services:
+  # Development shell — mounts project, no network during build
+  dev:
+    build: .
+    volumes:
+      - .:/app
+      - node_modules:/app/node_modules
+    entrypoint: /bin/bash
+    stdin_open: true
+    tty: true
+
+  # Run weave CLI against a target project (mount it at /target)
+  weave:
+    build: .
+    volumes:
+      - ./plugins:/app/plugins:ro
+    network_mode: none
+    # Mount your project: docker compose run weave init
+    # Override target: docker compose run -v /path/to/project:/target weave query /target/src/foo.ts
+
+  # Run tests in isolation
+  test:
+    build: .
+    entrypoint: ["npx", "vitest", "run"]
+    network_mode: none
+
+volumes:
+  node_modules:

@@ -1,0 +1,7 @@
+node_modules
+dist
+.weave
+.claude
+.git
+*.db
+coverage

@@ -1,7 +1,8 @@
 {
   "name": "@weave/mcp",
   "version": "0.1.0",
-  "description": "Loom MCP server for AI coding tool integration",
+  "description": "Weave MCP server for AI coding tool integration",
+  "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {

@@ -62,6 +62,7 @@ export class GraphStore {
         metadata    TEXT
       );
 
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_natural_key ON nodes(file_path, symbol_name, line_start);
       CREATE INDEX IF NOT EXISTS idx_nodes_file ON nodes(file_path);
       CREATE INDEX IF NOT EXISTS idx_nodes_kind ON nodes(kind);
       CREATE INDEX IF NOT EXISTS idx_nodes_symbol ON nodes(symbol_name);
@@ -105,14 +106,11 @@ export class GraphStore {
 
   private prepareStatements(): void {
     this.stmtUpsertNode = this.db.prepare(`
-      INSERT INTO nodes (id, file_path, symbol_name, kind, language, line_start, line_end, signature, metadata)
-      VALUES (@id, @filePath, @symbolName, @kind, @language, @lineStart, @lineEnd, @signature, @metadata)
-      ON CONFLICT(id) DO UPDATE SET
-        file_path = excluded.file_path,
-        symbol_name = excluded.symbol_name,
+      INSERT INTO nodes (file_path, symbol_name, kind, language, line_start, line_end, signature, metadata)
+      VALUES (@filePath, @symbolName, @kind, @language, @lineStart, @lineEnd, @signature, @metadata)
+      ON CONFLICT(file_path, symbol_name, line_start) DO UPDATE SET
         kind = excluded.kind,
         language = excluded.language,
-        line_start = excluded.line_start,
         line_end = excluded.line_end,
         signature = excluded.signature,
         metadata = excluded.metadata

@@ -172,7 +172,7 @@ export function run(argv: string[]): void {
           console.log();
         }
 
-        const errorCount = violations.filter(v => v.confidence >= (opts.strict ? 0.7 : 0.9)).length;
+        const errorCount = violations.filter((v: { confidence: number }) => v.confidence >= (opts.strict ? 0.7 : 0.9)).length;
         const warnCount = violations.length - errorCount;
 
         console.log(

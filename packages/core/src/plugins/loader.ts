@@ -4,8 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { parse as parseYaml } from 'yaml';
 import type { ConventionPlugin, PluginDetect, EdgeCreation } from '../types.js';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 /**
  * Scans for .convention.yaml plugin files, validates their structure,
@@ -82,7 +81,7 @@ export class PluginLoader {
       .map(e => join(dir, e.name));
   }
 
-  /** Find .convention.yaml files inside immediate subdirectories (for node_modules/@weave/*/). */
+  /** Find .convention.yaml files inside immediate subdirectories (for node_modules/@weave). */
   private async findYamlFilesInSubdirs(dir: string): Promise<string[]> {
     if (!(await this.directoryExists(dir))) return [];
 

@@ -1,0 +1,115 @@
+name: inertia
+version: 1.0.0
+description: Inertia.js bridge — connects PHP handlers to Vue page components with prop flow
+
+detect:
+  files:
+    - composer.json
+    - package.json
+  contains:
+    composer.json: "inertiajs/inertia-laravel"
+    package.json: "@inertiajs/vue3"
+
+node_kinds:
+  - inertia_page
+
+rules:
+  - name: inertia-render
+    description: Inertia::render connects a PHP handler to a Vue page component
+    match:
+      language: php
+      pattern: |
+        (member_call_expression
+          object: (name) @obj (#eq? @obj "Inertia")
+          name: (name) @method (#eq? @method "render")
+          arguments: (arguments
+            (string (string_content) @component)
+            (array_creation_expression)? @props))
+    creates:
+      - edge:
+          from: current_symbol
+          to:
+            resolve: "resources/js/Pages/{@component}.vue"
+          relationship: renders
+          metadata:
+            props: "@props"
+      - node:
+          file: "resources/js/Pages/{@component}.vue"
+          kind: inertia_page
+
+  - name: inertia-render-helper
+    description: inertia() helper function render call
+    match:
+      language: php
+      pattern: |
+        (function_call_expression
+          function: (name) @fn (#eq? @fn "inertia")
+          arguments: (arguments
+            (string (string_content) @component)
+            (array_creation_expression)? @props))
+    creates:
+      - edge:
+          from: current_symbol
+          to:
+            resolve: "resources/js/Pages/{@component}.vue"
+          relationship: renders
+          metadata:
+            props: "@props"
+      - node:
+          file: "resources/js/Pages/{@component}.vue"
+          kind: inertia_page
+
+  - name: inertia-shared-data
+    description: Inertia::share makes data globally available to all page components
+    match:
+      language: php
+      pattern: |
+        (member_call_expression
+          object: (name) @obj (#eq? @obj "Inertia")
+          name: (name) @method (#eq? @method "share")
+          arguments: (arguments
+            (string (string_content) @key)))
+    creates:
+      - edge:
+          from: current_symbol
+          to:
+            all_of_kind: inertia_page
+          relationship: shares_data
+          metadata:
+            key: "@key"
+
+  - name: inertia-use-form
+    description: useForm composable in Vue pages (Inertia form helper)
+    match:
+      language: typescript
+      file_pattern: "resources/js/Pages/**/*.vue"
+      pattern: |
+        (call_expression
+          function: (identifier) @fn (#eq? @fn "useForm")
+          arguments: (arguments (_) @form_shape))
+    creates:
+      - node_metadata:
+          kind: inertia_page
+          key: uses_form
+          value: "@form_shape"
+
+  - name: inertia-router-visit
+    description: Inertia router.visit / router.get / router.post linking pages
+    match:
+      language: typescript
+      file_pattern: "resources/js/**/*.vue"
+      pattern: |
+        (call_expression
+          function: (member_expression
+            object: (identifier) @obj (#eq? @obj "router")
+            property: (property_identifier) @method (#match? @method "^(visit|get|post|put|patch|delete)$"))
+          arguments: (arguments
+            (string (string_content) @route_path)))
+    creates:
+      - edge:
+          from: current_symbol
+          to: current_file
+          relationship: navigates_to
+          metadata:
+            method: "@method"
+            path: "@route_path"

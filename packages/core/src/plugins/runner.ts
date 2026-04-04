@@ -1,5 +1,5 @@
 import { basename } from 'node:path';
-import { minimatch } from 'glob';
+import { minimatch } from 'minimatch';
 import { GraphStore } from '../graph/store.js';
 import { TreeSitterParser } from '../parser/parser.js';
 import type {
@@ -46,7 +46,13 @@ export class PluginRunner {
     const tree = this.parser.parse(filePath);
     if (!tree) return;
 
-    const matches = this.parser.query(tree, rule.match.pattern);
+    let matches;
+    try {
+      matches = this.parser.query(tree, rule.match.pattern);
+    } catch {
+      // Tree-sitter query pattern doesn't match this grammar — skip rule silently
+      return;
+    }
     if (!matches || matches.length === 0) return;
 
     for (const match of matches) {

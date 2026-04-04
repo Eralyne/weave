@@ -127,7 +127,7 @@ server.tool(
     try {
       await ensureInit();
       const conventions = weave.conventions(kind);
-      const withExemplar = conventions.find((c) => c.exemplarId != null);
+      const withExemplar = conventions.find((c: { exemplarId: number | null }) => c.exemplarId != null);
       if (!withExemplar) {
         return jsonResult({ kind, exemplar: null, message: `No exemplar found for kind "${kind}"` });
       }
