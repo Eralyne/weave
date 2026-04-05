@@ -112,6 +112,37 @@ server.tool(
 );
 
 server.tool(
+  'weave_bootstrap',
+  'Agent-ready Weave-first bootstrap payload for a task',
+  {
+    file: z.string().describe('File path relative to project root'),
+    task: z.string().describe('Task description to bootstrap'),
+    scope: z.string().optional().describe('Natural-language scope hint for traversal'),
+    depth: z.number().optional().describe('Max traversal depth (default: 2)'),
+    maxFiles: z.number().optional().describe('Max files to include in the working set'),
+    maxConstraints: z.number().optional().describe('Max mined constraints to include'),
+    maxExemplars: z.number().optional().describe('Max exemplar files to include'),
+  },
+  async ({ file, task, scope, depth, maxFiles, maxConstraints, maxExemplars }) => {
+    try {
+      await ensureInit();
+      const result = weave.bootstrap({
+        task,
+        start: file,
+        scope,
+        depth,
+        maxFiles,
+        maxConstraints,
+        maxExemplars,
+      });
+      return jsonResult(result);
+    } catch (error) {
+      return errorResult(error);
+    }
+  },
+);
+
+server.tool(
   'weave_conventions',
   'Get derived conventions for a node kind',
   {

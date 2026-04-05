@@ -124,6 +124,45 @@ export function run(argv: string[]): void {
       }
     });
 
+  // --- bootstrap ---
+  program
+    .command('bootstrap <file>')
+    .description('Agent-ready Weave-first bootstrap payload for a task')
+    .requiredOption('-t, --task <task>', 'Task description to bootstrap')
+    .option('-s, --scope <scope>', 'Scope description for relevance filtering')
+    .option('-d, --depth <n>', 'Traversal depth', '2')
+    .option('--max-files <n>', 'Max files in the working set', '8')
+    .option('--max-constraints <n>', 'Max mined constraints', '6')
+    .option('--max-exemplars <n>', 'Max exemplar files', '3')
+    .action(async (
+      file: string,
+      opts: {
+        task: string;
+        scope?: string;
+        depth: string;
+        maxFiles: string;
+        maxConstraints: string;
+        maxExemplars: string;
+      },
+    ) => {
+      try {
+        const result = await withWeave(weave => weave.bootstrap({
+          task: opts.task,
+          start: file,
+          scope: opts.scope,
+          depth: parseInt(opts.depth, 10),
+          maxFiles: parseInt(opts.maxFiles, 10),
+          maxConstraints: parseInt(opts.maxConstraints, 10),
+          maxExemplars: parseInt(opts.maxExemplars, 10),
+        }));
+
+        console.log(JSON.stringify(result, null, 2));
+      } catch (err) {
+        printError('bootstrap', err);
+        process.exitCode = 1;
+      }
+    });
+
   // --- conventions ---
   program
     .command('conventions')

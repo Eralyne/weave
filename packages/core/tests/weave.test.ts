@@ -353,7 +353,15 @@ class SyncHooksCommand extends Command
         'routes/web.php',
       ]));
       expect(bundle.workingSet[0]?.file).toBe('app/Actions/Auth/ShowLoginPageAction.php');
-      expect(bundle.workingSet[0]?.reasons).toContain('start target');
+      expect(bundle.workingSet[0]?.provenance).toBe('explicit_graph');
+      expect(bundle.workingSet[0]?.confidence).toBe(1);
+      expect(bundle.workingSet[0]?.reasons).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          text: 'start target',
+          provenance: 'explicit_graph',
+          confidence: 1,
+        }),
+      ]));
       expect(bundle.workingSet[0]?.anchors).toEqual(expect.arrayContaining([
         expect.objectContaining({
           symbol: 'ShowLoginPageAction::asController',
@@ -366,12 +374,46 @@ class SyncHooksCommand extends Command
         expect.objectContaining({
           kind: expect.stringMatching(/^(action|inertia_page|method|class)$/),
           rule: expect.any(String),
+          provenance: 'mined_convention',
+          advisory: true,
         }),
       ]));
 
       expect(bundle.exemplars.length).toBeGreaterThan(0);
       expect(bundle.exemplars.some(exemplar => exemplar.kind === 'class')).toBe(false);
+      expect(bundle.exemplars[0]?.provenance).toBe('structural_similarity');
       expect(bundle.exemplars.every(exemplar => !bundle.workingSet.some(file => file.file === exemplar.file))).toBe(true);
+    } finally {
+      weave.close();
+    }
+  });
+
+  it('builds a Weave-first bootstrap payload for wrappers', async () => {
+    const projectRoot = createFixtureProject();
+    createdProjects.push(projectRoot);
+
+    const weave = new Weave(projectRoot);
+    try {
+      await weave.init();
+
+      const payload = weave.bootstrap({
+        task: 'Add a subtle login CTA copy tweak without inventing new auth flow',
+        start: 'app/Actions/Auth/ShowLoginPageAction.php',
+        depth: 1,
+        maxFiles: 4,
+        maxConstraints: 4,
+        maxExemplars: 3,
+      });
+
+      expect(payload.task).toContain('login CTA');
+      expect(payload.start).toBe('app/Actions/Auth/ShowLoginPageAction.php');
+      expect(payload.operatingMode).toBe('weave_first');
+      expect(payload.context.workingSet.map(file => file.file)).toContain('resources/js/Pages/Auth/Login.vue');
+      expect(payload.guidance.length).toBeGreaterThan(0);
+      expect(payload.fallbackPolicy.length).toBeGreaterThan(0);
+      expect(payload.prompt).toContain('You are operating in Weave-first mode.');
+      expect(payload.prompt).toContain('Add a subtle login CTA copy tweak');
+      expect(payload.prompt).toContain('"workingSet"');
     } finally {
       weave.close();
     }

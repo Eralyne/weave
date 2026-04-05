@@ -19,10 +19,13 @@ import type {
   SubgraphResult,
   ContextBundleQuery,
   ContextBundle,
+  BootstrapQuery,
+  BootstrapPayload,
   ContextFile,
   ContextConstraint,
   ContextExemplar,
   SubgraphNode,
+  ContextReason,
   ValidationViolation,
   Convention,
   ConventionPlugin,
@@ -324,6 +327,37 @@ export class Weave {
     };
   }
 
+  /**
+   * Agent bootstrap payload: Weave-first context plus compact operating rules.
+   * Intended for wrappers/orchestrators that want to inject Weave invisibly.
+   */
+  bootstrap(query: BootstrapQuery): BootstrapPayload {
+    const context = this.context(query);
+    const start = this.toRelativePath(query.start);
+    const guidance = [
+      'Use the workingSet as the initial scope for this task.',
+      'Treat workingSet items as explicit graph evidence and verify first-hop facts in code before editing.',
+      'Treat constraints as advisory repo patterns, not hard rules.',
+      'Treat exemplars as nearby examples to imitate when they fit, not as mandatory templates.',
+      'Prefer reusing existing functions, actions, requests, components, and composables in the workingSet before inventing new structures.',
+    ];
+    const fallbackPolicy = [
+      'Widen search only if the workingSet is insufficient to complete the task.',
+      'Widen search if explicit graph facts do not hold when inspected in code.',
+      'If you widen search, do it narrowly and explain what was missing from the Weave bundle.',
+    ];
+
+    return {
+      task: query.task,
+      start,
+      context,
+      operatingMode: 'weave_first',
+      guidance,
+      fallbackPolicy,
+      prompt: this.buildBootstrapPrompt(query.task, start, context, guidance, fallbackPolicy),
+    };
+  }
+
   /** Get derived conventions for a node kind. */
   conventions(kind?: string): Convention[] {
     return this.conventionEngine.getConventions(kind);
@@ -492,7 +526,7 @@ export class Weave {
     const fileEntries = new Map<string, {
       file: string;
       kinds: Set<string>;
-      reasons: Set<string>;
+      reasons: Map<string, ContextReason>;
       anchors: SubgraphNode[];
       score: number;
     }>();
@@ -505,7 +539,11 @@ export class Weave {
         entry.anchors.push(node);
       }
       if (node.file === start) {
-        entry.reasons.add('start target');
+        entry.reasons.set('start target', {
+          text: 'start target',
+          provenance: 'explicit_graph',
+          confidence: 1,
+        });
         entry.score += 100;
       }
     }
@@ -524,8 +562,13 @@ export class Weave {
       const fromEntry = this.getOrCreateFileEntry(fileEntries, fromNode.file);
       const toEntry = this.getOrCreateFileEntry(fileEntries, toNode.file);
 
-      fromEntry.reasons.add(`connected by ${label}`);
-      toEntry.reasons.add(`connected by ${label}`);
+      const reason = {
+        text: `connected by ${label}`,
+        provenance: 'explicit_graph' as const,
+        confidence: this.edgeReasonConfidence(edge, fromNode.file === start || toNode.file === start),
+      };
+      fromEntry.reasons.set(reason.text, reason);
+      toEntry.reasons.set(reason.text, reason);
 
       const edgeScore = fromNode.file === start || toNode.file === start ? 20 : 10;
       fromEntry.score += edgeScore;
@@ -538,6 +581,8 @@ export class Weave {
       .map(entry => ({
         file: entry.file,
         kinds: Array.from(entry.kinds).sort(),
+        provenance: 'explicit_graph' as const,
+        confidence: this.fileEntryConfidence(entry, entry.file === start),
         reasons: this.sortReasons(entry.reasons),
         anchors: entry.anchors
           .sort((a, b) => this.anchorPriority(b) - this.anchorPriority(a) || a.lines[0] - b.lines[0])
@@ -575,6 +620,8 @@ export class Weave {
         constraints.push({
           kind,
           rule: convention.property,
+          provenance: 'mined_convention',
+          advisory: true,
           confidence: convention.confidence,
           frequency: convention.frequency,
           total: convention.total,
@@ -628,6 +675,8 @@ export class Weave {
         kind,
         file: exemplar.file,
         reason: exemplar.reason,
+        provenance: 'structural_similarity',
+        confidence: this.kindConventionConfidence(kind),
         nodeId: exemplar.nodeId,
       });
     }
@@ -647,7 +696,7 @@ export class Weave {
     entries: Map<string, {
       file: string;
       kinds: Set<string>;
-      reasons: Set<string>;
+      reasons: Map<string, ContextReason>;
       anchors: SubgraphNode[];
       score: number;
     }>,
@@ -661,7 +710,7 @@ export class Weave {
     const created = {
       file,
       kinds: new Set<string>(),
-      reasons: new Set<string>(),
+      reasons: new Map<string, ContextReason>(),
       anchors: [] as SubgraphNode[],
       score: 0,
     };
@@ -669,12 +718,12 @@ export class Weave {
     return created;
   }
 
-  private sortReasons(reasons: Set<string>): string[] {
-    return Array.from(reasons)
+  private sortReasons(reasons: Map<string, ContextReason>): ContextReason[] {
+    return Array.from(reasons.values())
       .sort((a, b) => {
-        if (a === 'start target') return -1;
-        if (b === 'start target') return 1;
-        return a.localeCompare(b);
+        if (a.text === 'start target') return -1;
+        if (b.text === 'start target') return 1;
+        return b.confidence - a.confidence || a.text.localeCompare(b.text);
       })
       .slice(0, 3);
   }
@@ -742,7 +791,60 @@ export class Weave {
     }
   }
 
+  private fileEntryConfidence(
+    entry: {
+      reasons: Map<string, ContextReason>;
+      score: number;
+    },
+    isStart: boolean,
+  ): number {
+    if (isStart) return 1;
+    const bestReason = Math.max(...Array.from(entry.reasons.values()).map(reason => reason.confidence), 0.75);
+    return Math.min(0.98, Math.max(0.75, bestReason));
+  }
+
+  private edgeReasonConfidence(edge: { convention: string | null }, isFirstHop: boolean): number {
+    if (edge.convention) {
+      return isFirstHop ? 0.96 : 0.92;
+    }
+    return isFirstHop ? 0.93 : 0.88;
+  }
+
+  private kindConventionConfidence(kind: string): number {
+    const conventions = this.conventionEngine.getConventions(kind);
+    if (conventions.length === 0) {
+      return 0.7;
+    }
+    return conventions.reduce((best, convention) => Math.max(best, convention.confidence), 0.7);
+  }
+
   private isGeneratedPath(filePath: string): boolean {
     return filePath.startsWith('public/build/') || filePath.startsWith('.weave/');
+  }
+
+  private buildBootstrapPrompt(
+    task: string,
+    start: string,
+    context: ContextBundle,
+    guidance: string[],
+    fallbackPolicy: string[],
+  ): string {
+    return [
+      'You are operating in Weave-first mode.',
+      `Task: ${task}`,
+      `Entry file: ${start}`,
+      '',
+      'Use the following context bundle as your initial working set.',
+      'Do not broaden repo exploration unless the fallback policy applies.',
+      '',
+      'Guidance:',
+      ...guidance.map(item => `- ${item}`),
+      '',
+      'Fallback policy:',
+      ...fallbackPolicy.map(item => `- ${item}`),
+      '',
+      'Context bundle:',
+      JSON.stringify(context, null, 2),
+    ].join('\n');
   }
 }

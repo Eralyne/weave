@@ -130,6 +130,20 @@ export interface ContextBundle {
   exemplars: ContextExemplar[];
 }
 
+export interface BootstrapQuery extends ContextBundleQuery {
+  task: string;
+}
+
+export interface BootstrapPayload {
+  task: string;
+  start: string;
+  context: ContextBundle;
+  operatingMode: 'weave_first';
+  guidance: string[];
+  fallbackPolicy: string[];
+  prompt: string;
+}
+
 export interface SubgraphNode {
   id: number;
   file: string;
@@ -159,7 +173,9 @@ export interface ConventionReport {
 export interface ContextFile {
   file: string;
   kinds: string[];
-  reasons: string[];
+  provenance: 'explicit_graph';
+  confidence: number;
+  reasons: ContextReason[];
   anchors: Array<{
     symbol: string;
     kind: string;
@@ -167,9 +183,17 @@ export interface ContextFile {
   }>;
 }
 
+export interface ContextReason {
+  text: string;
+  provenance: 'explicit_graph';
+  confidence: number;
+}
+
 export interface ContextConstraint {
   kind: string;
   rule: string;
+  provenance: 'mined_convention';
+  advisory: true;
   confidence: number;
   frequency: number;
   total: number;
@@ -180,6 +204,8 @@ export interface ContextExemplar {
   kind: string;
   file: string;
   reason: string;
+  provenance: 'structural_similarity';
+  confidence: number;
   nodeId: number;
 }
 
