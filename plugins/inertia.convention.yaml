@@ -65,6 +65,49 @@ rules:
           file: "resources/js/Pages/{@component}.vue"
           kind: inertia_page
 
+  - name: inertia-render-without-props
+    description: Inertia::render connects a PHP handler to a Vue page component without props
+    match:
+      language: php
+      pattern: |
+        (scoped_call_expression
+          scope: (name) @obj (#eq? @obj "Inertia")
+          name: (name) @method (#eq? @method "render")
+          arguments: (arguments
+            (argument
+              [(string (string_content) @component)
+               (encapsed_string (string_content) @component)])))
+    creates:
+      - edge:
+          from: current_symbol
+          to:
+            resolve: "resources/js/Pages/{@component}.vue"
+          relationship: renders
+      - node:
+          file: "resources/js/Pages/{@component}.vue"
+          kind: inertia_page
+
+  - name: inertia-render-helper-without-props
+    description: inertia() helper function render call without props
+    match:
+      language: php
+      pattern: |
+        (function_call_expression
+          function: (name) @fn (#eq? @fn "inertia")
+          arguments: (arguments
+            (argument
+              [(string (string_content) @component)
+               (encapsed_string (string_content) @component)])))
+    creates:
+      - edge:
+          from: current_symbol
+          to:
+            resolve: "resources/js/Pages/{@component}.vue"
+          relationship: renders
+      - node:
+          file: "resources/js/Pages/{@component}.vue"
+          kind: inertia_page
+
   - name: inertia-shared-data
     description: Inertia::share makes data globally available to all page components
     match:

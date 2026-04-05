@@ -8,4 +8,5 @@ export { PluginRunner } from './plugins/runner.js';
 export { ConventionEngine } from './conventions/engine.js';
 export { ConventionValidator } from './conventions/validator.js';
 export { FileWatcher } from './cache/watcher.js';
+export { IndexingDiagnosticsCollector } from './indexing-diagnostics.js';
 export { Weave } from './weave.js';

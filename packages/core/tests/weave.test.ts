@@ -10,7 +10,9 @@ function createFixtureProject(): string {
   const projectRoot = mkdtempSync(join(tmpdir(), 'weave-fixture-'));
 
   mkdirSync(join(projectRoot, 'app/Actions/Auth'), { recursive: true });
+  mkdirSync(join(projectRoot, 'app/Actions/Admin'), { recursive: true });
   mkdirSync(join(projectRoot, 'resources/js/Pages/Auth'), { recursive: true });
+  mkdirSync(join(projectRoot, 'resources/js/Pages/Admin/Hooks'), { recursive: true });
   mkdirSync(join(projectRoot, 'routes'), { recursive: true });
 
   writeFileSync(join(projectRoot, 'artisan'), '#!/usr/bin/env php\n');
@@ -71,13 +73,107 @@ defineProps<{ canResetPassword: boolean }>()
 `,
   );
   writeFileSync(
+    join(projectRoot, 'app/Actions/Admin/ShowHookCreatePageAction.php'),
+    `<?php
+
+namespace App\\Actions\\Admin;
+
+use Inertia\\Inertia;
+use Lorisleiva\\Actions\\Concerns\\AsAction;
+
+class ShowHookCreatePageAction
+{
+    use AsAction;
+
+    public function asController()
+    {
+        return Inertia::render('Admin/Hooks/Create');
+    }
+}
+`,
+  );
+  writeFileSync(
+    join(projectRoot, 'resources/js/Pages/Admin/Hooks/Create.vue'),
+    `<template>
+  <div>Create Hook</div>
+</template>
+`,
+  );
+  writeFileSync(
     join(projectRoot, 'routes/web.php'),
     `<?php
 
+use App\\Actions\\Admin\\ShowHookCreatePageAction;
 use App\\Actions\\Auth\\ShowLoginPageAction;
 use Illuminate\\Support\\Facades\\Route;
 
 Route::get('/login', ShowLoginPageAction::class);
+Route::get('/admin/hooks/create', ShowHookCreatePageAction::class);
+`,
+  );
+
+  return projectRoot;
+}
+
+function createDiagnosticsProject(): string {
+  const projectRoot = mkdtempSync(join(tmpdir(), 'weave-diagnostics-'));
+
+  mkdirSync(join(projectRoot, 'app/Actions/Auth'), { recursive: true });
+  mkdirSync(join(projectRoot, 'resources/js'), { recursive: true });
+  mkdirSync(join(projectRoot, 'routes'), { recursive: true });
+
+  writeFileSync(join(projectRoot, 'artisan'), '#!/usr/bin/env php\n');
+  writeFileSync(
+    join(projectRoot, 'composer.json'),
+    JSON.stringify({
+      require: {
+        'laravel/framework': '^11.0',
+        'lorisleiva/laravel-actions': '^2.0',
+      },
+    }, null, 2),
+  );
+  writeFileSync(
+    join(projectRoot, 'package.json'),
+    JSON.stringify({
+      dependencies: {
+        vue: '^3.0.0',
+      },
+    }, null, 2),
+  );
+
+  writeFileSync(
+    join(projectRoot, 'app/Actions/Auth/RealAction.php'),
+    `<?php
+
+namespace App\\Actions\\Auth;
+
+use Lorisleiva\\Actions\\Concerns\\AsAction;
+
+class RealAction
+{
+    use AsAction;
+}
+`,
+  );
+
+  writeFileSync(
+    join(projectRoot, 'resources/js/app.ts'),
+    `import { missingThing } from './missing'
+
+export function boot() {
+  return missingThing()
+}
+`,
+  );
+
+  writeFileSync(
+    join(projectRoot, 'routes/web.php'),
+    `<?php
+
+use App\\Actions\\Auth\\MissingAction;
+use Illuminate\\Support\\Facades\\Route;
+
+Route::get('/broken', MissingAction::class);
 `,
   );
 
@@ -193,13 +289,89 @@ class SyncHooksCommand extends Command
         start: 'routes/web.php',
         depth: 2,
       });
-      expect(routeResult.edges.filter(edge => edge.relationship === 'routes_to')).toHaveLength(1);
+      expect(routeResult.edges.some(edge => edge.relationship === 'routes_to')).toBe(true);
 
       const pageResult = weave.query({
         start: 'resources/js/Pages/Auth/Login.vue',
         depth: 0,
       });
       expect(pageResult.nodes.some(node => node.kind === 'inertia_page')).toBe(true);
+    } finally {
+      weave.close();
+    }
+  });
+
+  it('builds convention edges for inertia renders without props', async () => {
+    const projectRoot = createFixtureProject();
+    createdProjects.push(projectRoot);
+
+    const weave = new Weave(projectRoot);
+    try {
+      await weave.init();
+
+      const result = weave.query({
+        start: 'app/Actions/Admin/ShowHookCreatePageAction.php',
+        depth: 1,
+      });
+
+      const pageNode = result.nodes.find(
+        node =>
+          node.file === 'resources/js/Pages/Admin/Hooks/Create.vue'
+          && node.kind === 'inertia_page'
+          && node.symbol === 'Create',
+      );
+
+      expect(pageNode).toBeDefined();
+      expect(result.edges).toContainEqual(expect.objectContaining({
+        relationship: 'renders',
+        convention: 'inertia',
+      }));
+    } finally {
+      weave.close();
+    }
+  });
+
+  it('builds a compact context bundle with working files, constraints, and exemplars', async () => {
+    const projectRoot = createFixtureProject();
+    createdProjects.push(projectRoot);
+
+    const weave = new Weave(projectRoot);
+    try {
+      await weave.init();
+
+      const bundle = weave.context({
+        start: 'app/Actions/Auth/ShowLoginPageAction.php',
+        depth: 1,
+        maxFiles: 4,
+        maxConstraints: 4,
+        maxExemplars: 4,
+      });
+
+      expect(bundle.workingSet.map(file => file.file)).toEqual(expect.arrayContaining([
+        'app/Actions/Auth/ShowLoginPageAction.php',
+        'resources/js/Pages/Auth/Login.vue',
+        'routes/web.php',
+      ]));
+      expect(bundle.workingSet[0]?.file).toBe('app/Actions/Auth/ShowLoginPageAction.php');
+      expect(bundle.workingSet[0]?.reasons).toContain('start target');
+      expect(bundle.workingSet[0]?.anchors).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          symbol: 'ShowLoginPageAction::asController',
+          kind: 'method',
+        }),
+      ]));
+
+      expect(bundle.constraints.length).toBeGreaterThan(0);
+      expect(bundle.constraints).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          kind: expect.stringMatching(/^(action|inertia_page|method|class)$/),
+          rule: expect.any(String),
+        }),
+      ]));
+
+      expect(bundle.exemplars.length).toBeGreaterThan(0);
+      expect(bundle.exemplars.some(exemplar => exemplar.kind === 'class')).toBe(false);
+      expect(bundle.exemplars.every(exemplar => !bundle.workingSet.some(file => file.file === exemplar.file))).toBe(true);
     } finally {
       weave.close();
     }
@@ -225,6 +397,62 @@ class SyncHooksCommand extends Command
       expect(result.nodes).toHaveLength(0);
     } finally {
       weave.close();
+    }
+  });
+
+  it('reports skipped L2 and L3 edges in status diagnostics', async () => {
+    const projectRoot = createDiagnosticsProject();
+    createdProjects.push(projectRoot);
+
+    const weave = new Weave(projectRoot);
+    try {
+      await weave.init();
+      const status = await weave.status();
+
+      expect(status.diagnostics.totals.l2EdgesSkipped).toBeGreaterThan(0);
+      expect(status.diagnostics.totals.l3EdgesSkipped).toBeGreaterThan(0);
+
+      expect(status.diagnostics.files).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          file: 'resources/js/app.ts',
+          l2EdgesSkipped: expect.any(Number),
+        }),
+        expect.objectContaining({
+          file: 'routes/web.php',
+          l3EdgesSkipped: expect.any(Number),
+        }),
+      ]));
+
+      expect(status.diagnostics.pluginRules).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          plugin: 'laravel-actions',
+          rule: 'action-as-controller-route',
+          edgesSkipped: expect.any(Number),
+        }),
+      ]));
+
+      expect(status.diagnostics.issues).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          file: 'resources/js/app.ts',
+          layer: 2,
+        }),
+        expect.objectContaining({
+          file: 'routes/web.php',
+          layer: 3,
+          plugin: 'laravel-actions',
+        }),
+      ]));
+    } finally {
+      weave.close();
+    }
+
+    const freshWeave = new Weave(projectRoot);
+    try {
+      const freshStatus = await freshWeave.status();
+      expect(freshStatus.diagnostics.totals.l2EdgesSkipped).toBeGreaterThan(0);
+      expect(freshStatus.diagnostics.totals.l3EdgesSkipped).toBeGreaterThan(0);
+    } finally {
+      freshWeave.close();
     }
   });
 });

@@ -3,7 +3,7 @@ import chalk from 'chalk';
 import { readFileSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { Weave } from '@weave/core';
-import type { WeaveConfig } from '@weave/core';
+import type { FileIndexDiagnostics, PluginRuleDiagnostics, WeaveConfig, WeaveStatus } from '@weave/core';
 import { parse as parseYaml } from 'yaml';
 
 function loadConfig(projectRoot: string): Partial<WeaveConfig> {
@@ -84,6 +84,42 @@ export function run(argv: string[]): void {
         console.log(JSON.stringify(result, null, 2));
       } catch (err) {
         printError('query', err);
+        process.exitCode = 1;
+      }
+    });
+
+  // --- context ---
+  program
+    .command('context <file>')
+    .description('Compact agent context bundle: working set, mined constraints, and exemplars')
+    .option('-s, --scope <scope>', 'Scope description for relevance filtering')
+    .option('-d, --depth <n>', 'Traversal depth', '2')
+    .option('--max-files <n>', 'Max files in the working set', '8')
+    .option('--max-constraints <n>', 'Max mined constraints', '6')
+    .option('--max-exemplars <n>', 'Max exemplar files', '3')
+    .action(async (
+      file: string,
+      opts: {
+        scope?: string;
+        depth: string;
+        maxFiles: string;
+        maxConstraints: string;
+        maxExemplars: string;
+      },
+    ) => {
+      try {
+        const result = await withWeave(weave => weave.context({
+          start: file,
+          scope: opts.scope,
+          depth: parseInt(opts.depth, 10),
+          maxFiles: parseInt(opts.maxFiles, 10),
+          maxConstraints: parseInt(opts.maxConstraints, 10),
+          maxExemplars: parseInt(opts.maxExemplars, 10),
+        }));
+
+        console.log(JSON.stringify(result, null, 2));
+      } catch (err) {
+        printError('context', err);
         process.exitCode = 1;
       }
     });
@@ -221,13 +257,16 @@ export function run(argv: string[]): void {
     .description('Index stats — node/edge counts, active plugins, stale files')
     .action(async () => {
       try {
-        const status = await withWeave(weave => weave.status());
+        const status = await withWeave(weave => weave.status()) as WeaveStatus;
 
         console.log(chalk.bold('Weave Status'));
         console.log();
         console.log(`  Nodes:       ${chalk.bold(String(status.nodeCount))}`);
         console.log(`  Edges:       ${chalk.bold(String(status.edgeCount))}`);
         console.log(`  Plugins:     ${status.plugins.length > 0 ? status.plugins.join(', ') : chalk.dim('none')}`);
+        console.log(`  L2 skipped:  ${status.diagnostics.totals.l2EdgesSkipped}`);
+        console.log(`  L3 skipped:  ${status.diagnostics.totals.l3EdgesSkipped}`);
+        console.log(`  Issues:      ${status.diagnostics.totals.issues}`);
 
         if (status.staleFiles.length > 0) {
           console.log(`  Stale files: ${chalk.yellow(String(status.staleFiles.length))}`);
@@ -236,6 +275,36 @@ export function run(argv: string[]): void {
           }
         } else {
           console.log(`  Stale files: ${chalk.green('0')}`);
+        }
+
+        const noisyFiles = status.diagnostics.files
+          .filter((file: FileIndexDiagnostics) => file.l2EdgesSkipped > 0 || file.l3EdgesSkipped > 0 || file.queryErrors > 0)
+          .sort((a: FileIndexDiagnostics, b: FileIndexDiagnostics) => (b.l2EdgesSkipped + b.l3EdgesSkipped + b.queryErrors) - (a.l2EdgesSkipped + a.l3EdgesSkipped + a.queryErrors))
+          .slice(0, 10);
+
+        if (noisyFiles.length > 0) {
+          console.log();
+          console.log(chalk.bold('Diagnostic files'));
+          for (const file of noisyFiles) {
+            console.log(
+              `  ${file.file} ${chalk.dim(`(L2 skipped: ${file.l2EdgesSkipped}, L3 skipped: ${file.l3EdgesSkipped}, query errors: ${file.queryErrors})`)}`,
+            );
+          }
+        }
+
+        const noisyRules = status.diagnostics.pluginRules
+          .filter((rule: PluginRuleDiagnostics) => rule.edgesSkipped > 0 || rule.queryErrors > 0)
+          .sort((a: PluginRuleDiagnostics, b: PluginRuleDiagnostics) => (b.edgesSkipped + b.queryErrors) - (a.edgesSkipped + a.queryErrors))
+          .slice(0, 10);
+
+        if (noisyRules.length > 0) {
+          console.log();
+          console.log(chalk.bold('Diagnostic rules'));
+          for (const rule of noisyRules) {
+            console.log(
+              `  ${rule.plugin}:${rule.rule} ${chalk.dim(`(skipped: ${rule.edgesSkipped}, query errors: ${rule.queryErrors}, created: ${rule.edgesCreated})`)}`,
+            );
+          }
         }
       } catch (err) {
         printError('status', err);

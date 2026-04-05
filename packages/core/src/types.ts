@@ -115,6 +115,21 @@ export interface SubgraphResult {
   conventions?: ConventionReport[];
 }
 
+export interface ContextBundleQuery {
+  start: string;
+  scope?: string;
+  depth?: number;
+  maxFiles?: number;
+  maxConstraints?: number;
+  maxExemplars?: number;
+}
+
+export interface ContextBundle {
+  workingSet: ContextFile[];
+  constraints: ContextConstraint[];
+  exemplars: ContextExemplar[];
+}
+
 export interface SubgraphNode {
   id: number;
   file: string;
@@ -139,6 +154,33 @@ export interface ConventionReport {
     file: string;
     reason: string;
   };
+}
+
+export interface ContextFile {
+  file: string;
+  kinds: string[];
+  reasons: string[];
+  anchors: Array<{
+    symbol: string;
+    kind: string;
+    lines: [number, number];
+  }>;
+}
+
+export interface ContextConstraint {
+  kind: string;
+  rule: string;
+  confidence: number;
+  frequency: number;
+  total: number;
+  exemplarFile: string | null;
+}
+
+export interface ContextExemplar {
+  kind: string;
+  file: string;
+  reason: string;
+  nodeId: number;
 }
 
 // -- Validation types --
@@ -169,4 +211,63 @@ export interface WeaveConfig {
   monorepo?: boolean;
   conventionOverrides?: ConventionOverride[];
   plugins?: string[];
+}
+
+// -- Indexing diagnostics --
+
+export interface IndexingIssue {
+  file: string;
+  layer: 2 | 3;
+  reason: string;
+  relationship?: string;
+  plugin?: string;
+  rule?: string;
+  details?: Record<string, unknown> | null;
+}
+
+export interface FileIndexDiagnostics {
+  file: string;
+  l2EdgesCreated: number;
+  l2EdgesSkipped: number;
+  l3EdgesCreated: number;
+  l3EdgesSkipped: number;
+  nodeCreates: number;
+  metadataUpdates: number;
+  queryErrors: number;
+}
+
+export interface PluginRuleDiagnostics {
+  plugin: string;
+  rule: string;
+  filesEvaluated: number;
+  matches: number;
+  edgesCreated: number;
+  edgesSkipped: number;
+  nodesCreated: number;
+  metadataUpdates: number;
+  queryErrors: number;
+}
+
+export interface IndexingDiagnostics {
+  totals: {
+    l2EdgesCreated: number;
+    l2EdgesSkipped: number;
+    l3EdgesCreated: number;
+    l3EdgesSkipped: number;
+    nodeCreates: number;
+    metadataUpdates: number;
+    queryErrors: number;
+    issues: number;
+  };
+  files: FileIndexDiagnostics[];
+  pluginRules: PluginRuleDiagnostics[];
+  issues: IndexingIssue[];
+}
+
+export interface WeaveStatus {
+  nodeCount: number;
+  edgeCount: number;
+  plugins: string[];
+  staleFiles: string[];
+  diagnostics: IndexingDiagnostics;
 }

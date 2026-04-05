@@ -83,6 +83,35 @@ server.tool(
 );
 
 server.tool(
+  'weave_context',
+  'Compact task context bundle for agents: working set, mined constraints, and exemplar files',
+  {
+    file: z.string().describe('File path relative to project root'),
+    scope: z.string().optional().describe('Natural-language scope hint for traversal'),
+    depth: z.number().optional().describe('Max traversal depth (default: 3)'),
+    maxFiles: z.number().optional().describe('Max files to include in the working set'),
+    maxConstraints: z.number().optional().describe('Max mined constraints to include'),
+    maxExemplars: z.number().optional().describe('Max exemplar files to include'),
+  },
+  async ({ file, scope, depth, maxFiles, maxConstraints, maxExemplars }) => {
+    try {
+      await ensureInit();
+      const result = weave.context({
+        start: file,
+        scope,
+        depth,
+        maxFiles,
+        maxConstraints,
+        maxExemplars,
+      });
+      return jsonResult(result);
+    } catch (error) {
+      return errorResult(error);
+    }
+  },
+);
+
+server.tool(
   'weave_conventions',
   'Get derived conventions for a node kind',
   {
@@ -165,7 +194,7 @@ server.tool(
   async () => {
     try {
       await ensureInit();
-      const result = weave.status();
+      const result = await weave.status();
       return jsonResult(result);
     } catch (error) {
       return errorResult(error);

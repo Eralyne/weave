@@ -5,7 +5,7 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "npm run build --workspaces",
+    "build": "npm run build --workspace=@weave/core && npm run build --workspace=@weave/cli && npm run build --workspace=@weave/mcp",
     "test": "npm run test --workspaces",
     "lint": "eslint packages/*/src/**/*.ts",
     "clean": "rm -rf packages/*/dist"

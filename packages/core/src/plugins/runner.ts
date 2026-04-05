@@ -1,6 +1,7 @@
 import { basename } from 'node:path';
 import { minimatch } from 'minimatch';
 import { GraphStore } from '../graph/store.js';
+import { IndexingDiagnosticsCollector } from '../indexing-diagnostics.js';
 import { TreeSitterParser } from '../parser/parser.js';
 import { toProjectRelative } from '../path-utils.js';
 import type {
@@ -36,15 +37,25 @@ export class PluginRunner {
   }
 
   /** Apply all rules from a plugin to a file. */
-  applyRules(filePath: string, plugin: ConventionPlugin): void {
+  applyRules(
+    filePath: string,
+    plugin: ConventionPlugin,
+    diagnostics?: IndexingDiagnosticsCollector,
+  ): void {
     for (const rule of plugin.rules) {
-      this.applyRule(filePath, rule, plugin.name);
+      this.applyRule(filePath, rule, plugin.name, diagnostics);
     }
   }
 
   /** Apply a single rule to a file if it matches language and file pattern. */
-  private applyRule(filePath: string, rule: ConventionRule, pluginName: string): void {
+  private applyRule(
+    filePath: string,
+    rule: ConventionRule,
+    pluginName: string,
+    diagnostics?: IndexingDiagnosticsCollector,
+  ): void {
     const relativeFilePath = this.relPath(filePath);
+    diagnostics?.recordRuleFileEvaluated(pluginName, rule.name, relativeFilePath);
     const fileLanguage = this.detectLanguage(filePath);
     // Vue SFCs contain TypeScript in <script setup>, so allow typescript rules on .vue files
     const languageMatches = fileLanguage === rule.match.language
@@ -72,16 +83,18 @@ export class PluginRunner {
     let matches;
     try {
       matches = this.parser.query(tree, rule.match.pattern);
-    } catch {
+    } catch (error) {
       // Tree-sitter query pattern doesn't match this grammar — skip rule silently
+      diagnostics?.recordQueryError(pluginName, rule.name, relativeFilePath, error);
       return;
     }
     if (!matches || matches.length === 0) return;
 
     for (const match of matches) {
+      diagnostics?.recordRuleMatch(pluginName, rule.name);
       const captures = this.extractCaptures(match, lineOffset);
       captures.set('__current_file__', relativeFilePath);
-      this.processCreates(filePath, rule.creates, captures, pluginName);
+      this.processCreates(filePath, rule, captures, pluginName, diagnostics);
     }
   }
 
@@ -116,25 +129,33 @@ export class PluginRunner {
   /** Process all creation directives for a single match. */
   private processCreates(
     filePath: string,
-    creates: ConventionRule['creates'],
+    rule: ConventionRule,
     captures: Captures,
     pluginName: string,
+    diagnostics?: IndexingDiagnosticsCollector,
   ): void {
-    for (const creation of creates) {
+    for (const creation of rule.creates) {
       if ('node' in creation) {
-        this.processNodeCreation(creation.node, captures, pluginName);
+        this.processNodeCreation(creation.node, captures, pluginName, rule.name, diagnostics);
       }
     }
 
-    for (const creation of creates) {
+    for (const creation of rule.creates) {
       if ('node_metadata' in creation) {
-        this.processNodeMetadataUpdate(filePath, creation.node_metadata, captures);
+        this.processNodeMetadataUpdate(
+          filePath,
+          creation.node_metadata,
+          captures,
+          pluginName,
+          rule.name,
+          diagnostics,
+        );
       }
     }
 
-    for (const creation of creates) {
+    for (const creation of rule.creates) {
       if ('edge' in creation) {
-        this.processEdgeCreation(filePath, creation.edge, captures, pluginName);
+        this.processEdgeCreation(filePath, creation.edge, captures, pluginName, rule.name, diagnostics);
       }
     }
   }
@@ -145,16 +166,33 @@ export class PluginRunner {
     edge: EdgeCreation,
     captures: Captures,
     pluginName: string,
+    ruleName: string,
+    diagnostics?: IndexingDiagnosticsCollector,
   ): void {
     const sourceNodes = this.resolveTarget(edge.from, filePath, captures);
     const targetNodes = this.resolveTarget(edge.to, filePath, captures);
+    const relativeFilePath = this.relPath(filePath);
 
-    if (sourceNodes.length === 0 || targetNodes.length === 0) return;
+    if (sourceNodes.length === 0 || targetNodes.length === 0) {
+      diagnostics?.recordL3EdgeSkipped(
+        pluginName,
+        ruleName,
+        relativeFilePath,
+        edge.relationship,
+        this.missingEndpointReason(sourceNodes.length === 0, targetNodes.length === 0),
+        {
+          from: typeof edge.from === 'string' ? edge.from : edge.from,
+          to: typeof edge.to === 'string' ? edge.to : edge.to,
+        },
+      );
+      return;
+    }
 
     const metadata = edge.metadata
       ? this.interpolateMetadata(edge.metadata, captures)
       : null;
 
+    let createdEdges = 0;
     for (const source of sourceNodes) {
       for (const target of targetNodes) {
         this.store.createEdge({
@@ -166,15 +204,19 @@ export class PluginRunner {
           metadata,
           confidence: 1.0,
         });
+        createdEdges++;
       }
     }
+    diagnostics?.recordL3EdgeCreated(pluginName, ruleName, relativeFilePath, createdEdges);
   }
 
   /** Ensure a node exists for a convention-specified file/kind. */
   private processNodeCreation(
     nodeSpec: NodeCreation,
     captures: Captures,
-    _pluginName: string,
+    pluginName: string,
+    ruleName: string,
+    diagnostics?: IndexingDiagnosticsCollector,
   ): void {
     const resolvedFile = this.relPath(this.interpolate(nodeSpec.file, captures));
     const existing = this.store.getNodesByFile(resolvedFile)
@@ -195,6 +237,7 @@ export class PluginRunner {
         ? this.interpolateMetadata(nodeSpec.metadata, captures)
         : null,
     });
+    diagnostics?.recordNodeCreated(pluginName, ruleName, resolvedFile);
   }
 
   /** Update metadata on nodes matching the specified kind in the current file. */
@@ -202,6 +245,9 @@ export class PluginRunner {
     filePath: string,
     update: NodeMetadataUpdate,
     captures: Captures,
+    pluginName: string,
+    ruleName: string,
+    diagnostics?: IndexingDiagnosticsCollector,
   ): void {
     const relativeFilePath = this.relPath(filePath);
     const nodes = this.store.getNodesByFile(relativeFilePath)
@@ -213,6 +259,9 @@ export class PluginRunner {
       const existing = node.metadata ?? {};
       existing[update.key] = resolvedValue;
       this.store.updateNodeMetadata(node.id, existing);
+    }
+    if (nodes.length > 0) {
+      diagnostics?.recordMetadataUpdated(pluginName, ruleName, relativeFilePath, nodes.length);
     }
   }
 
@@ -557,5 +606,12 @@ export class PluginRunner {
       'sql': 'sql',
     };
     return languageMap[ext] ?? ext;
+  }
+
+  private missingEndpointReason(sourceMissing: boolean, targetMissing: boolean): string {
+    if (sourceMissing && targetMissing) return 'missing_source_and_target';
+    if (sourceMissing) return 'missing_source';
+    if (targetMissing) return 'missing_target';
+    return 'unknown';
   }
 }
