@@ -9,6 +9,7 @@ dist/
 .claude/
 *.db
 SPEC.md
+WEAVE_DOCTRINE.local.md
 .DS_Store
 coverage/
 .env

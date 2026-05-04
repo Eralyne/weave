@@ -57,7 +57,13 @@ node packages/cli/dist/bin.js context app/Actions/Auth/ShowLoginPageAction.php
 Build an agent-ready bootstrap payload:
 
 ```bash
-node packages/cli/dist/bin.js bootstrap app/Actions/Auth/ShowLoginPageAction.php --task "Add a login CTA copy tweak"
+node packages/cli/dist/bin.js bootstrap --task "Add a login CTA copy tweak"
+```
+
+Print just the prompt you can paste into an agent:
+
+```bash
+node packages/cli/dist/bin.js prompt --task "Add a login CTA copy tweak" --copy
 ```
 
 Graph artifacts are written to:
@@ -75,7 +81,8 @@ Main commands:
 
 - `weave init`
 - `weave context <file>`
-- `weave bootstrap <file> --task "..."`
+- `weave bootstrap [file] --task "..."`
+- `weave prompt [file] --task "..."`
 - `weave query <file>`
 - `weave status`
 - `weave conventions`
@@ -87,10 +94,25 @@ Main commands:
 
 ## MCP
 
-The MCP server runs over stdio and takes the target project root as its first argument:
+The MCP server runs over stdio and defaults to the current working directory as the project root.
+
+Once `@weave/mcp` is published, the simplest Claude Code setup is:
 
 ```bash
-node /absolute/path/to/weave/packages/mcp/dist/index.js /absolute/path/to/project
+claude mcp add weave --scope project -- npx -y @weave/mcp
+```
+
+Or write the project `.mcp.json` automatically:
+
+```bash
+npx -y @weave/mcp install-claude
+```
+
+You can still run it directly and optionally pass a project root:
+
+```bash
+node /absolute/path/to/weave/packages/mcp/dist/bin.js
+node /absolute/path/to/weave/packages/mcp/dist/bin.js /absolute/path/to/project
 ```
 
 Minimal MCP config:
@@ -99,11 +121,9 @@ Minimal MCP config:
 {
   "mcpServers": {
     "weave": {
-      "command": "node",
-      "args": [
-        "/absolute/path/to/weave/packages/mcp/dist/index.js",
-        "/absolute/path/to/project"
-      ]
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@weave/mcp"]
     }
   }
 }

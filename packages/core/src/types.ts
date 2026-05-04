@@ -130,13 +130,29 @@ export interface ContextBundle {
   exemplars: ContextExemplar[];
 }
 
-export interface BootstrapQuery extends ContextBundleQuery {
+export interface BootstrapQuery {
   task: string;
+  start?: string;
+  scope?: string;
+  depth?: number;
+  maxFiles?: number;
+  maxConstraints?: number;
+  maxExemplars?: number;
+  maxEntryCandidates?: number;
+}
+
+export interface BootstrapEntryCandidate {
+  file: string;
+  confidence: number;
+  reasons: string[];
 }
 
 export interface BootstrapPayload {
   task: string;
   start: string;
+  startSource: 'provided' | 'inferred';
+  taskMode?: 'implementation' | 'audit_communication' | 'audit_architecture';
+  entryCandidates: BootstrapEntryCandidate[];
   context: ContextBundle;
   operatingMode: 'weave_first';
   guidance: string[];
@@ -173,7 +189,7 @@ export interface ConventionReport {
 export interface ContextFile {
   file: string;
   kinds: string[];
-  provenance: 'explicit_graph';
+  provenance: 'explicit_graph' | 'task_heuristic';
   confidence: number;
   reasons: ContextReason[];
   anchors: Array<{
@@ -185,7 +201,7 @@ export interface ContextFile {
 
 export interface ContextReason {
   text: string;
-  provenance: 'explicit_graph';
+  provenance: 'explicit_graph' | 'task_heuristic';
   confidence: number;
 }
 
@@ -204,7 +220,7 @@ export interface ContextExemplar {
   kind: string;
   file: string;
   reason: string;
-  provenance: 'structural_similarity';
+  provenance: 'structural_similarity' | 'peer_precedent';
   confidence: number;
   nodeId: number;
 }

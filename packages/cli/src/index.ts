@@ -1,5 +1,6 @@
 import { Command } from 'commander';
 import chalk from 'chalk';
+import { spawnSync } from 'node:child_process';
 import { readFileSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { Weave } from '@weave/core';
@@ -94,17 +95,17 @@ export function run(argv: string[]): void {
     .description('Compact agent context bundle: working set, mined constraints, and exemplars')
     .option('-s, --scope <scope>', 'Scope description for relevance filtering')
     .option('-d, --depth <n>', 'Traversal depth', '2')
-    .option('--max-files <n>', 'Max files in the working set', '8')
-    .option('--max-constraints <n>', 'Max mined constraints', '6')
-    .option('--max-exemplars <n>', 'Max exemplar files', '3')
+    .option('--max-files <n>', 'Max files in the working set')
+    .option('--max-constraints <n>', 'Max mined constraints')
+    .option('--max-exemplars <n>', 'Max exemplar files')
     .action(async (
       file: string,
       opts: {
         scope?: string;
         depth: string;
-        maxFiles: string;
-        maxConstraints: string;
-        maxExemplars: string;
+        maxFiles?: string;
+        maxConstraints?: string;
+        maxExemplars?: string;
       },
     ) => {
       try {
@@ -112,9 +113,9 @@ export function run(argv: string[]): void {
           start: file,
           scope: opts.scope,
           depth: parseInt(opts.depth, 10),
-          maxFiles: parseInt(opts.maxFiles, 10),
-          maxConstraints: parseInt(opts.maxConstraints, 10),
-          maxExemplars: parseInt(opts.maxExemplars, 10),
+          maxFiles: opts.maxFiles ? parseInt(opts.maxFiles, 10) : undefined,
+          maxConstraints: opts.maxConstraints ? parseInt(opts.maxConstraints, 10) : undefined,
+          maxExemplars: opts.maxExemplars ? parseInt(opts.maxExemplars, 10) : undefined,
         }));
 
         console.log(JSON.stringify(result, null, 2));
@@ -126,23 +127,23 @@ export function run(argv: string[]): void {
 
   // --- bootstrap ---
   program
-    .command('bootstrap <file>')
-    .description('Agent-ready Weave-first bootstrap payload for a task')
+    .command('bootstrap [file]')
+    .description('Agent-ready Weave-first bootstrap payload for a task; infers an entry file when omitted')
     .requiredOption('-t, --task <task>', 'Task description to bootstrap')
     .option('-s, --scope <scope>', 'Scope description for relevance filtering')
     .option('-d, --depth <n>', 'Traversal depth', '2')
-    .option('--max-files <n>', 'Max files in the working set', '8')
-    .option('--max-constraints <n>', 'Max mined constraints', '6')
-    .option('--max-exemplars <n>', 'Max exemplar files', '3')
+    .option('--max-files <n>', 'Max files in the working set')
+    .option('--max-constraints <n>', 'Max mined constraints')
+    .option('--max-exemplars <n>', 'Max exemplar files')
     .action(async (
-      file: string,
+      file: string | undefined,
       opts: {
         task: string;
         scope?: string;
         depth: string;
-        maxFiles: string;
-        maxConstraints: string;
-        maxExemplars: string;
+        maxFiles?: string;
+        maxConstraints?: string;
+        maxExemplars?: string;
       },
     ) => {
       try {
@@ -151,14 +152,61 @@ export function run(argv: string[]): void {
           start: file,
           scope: opts.scope,
           depth: parseInt(opts.depth, 10),
-          maxFiles: parseInt(opts.maxFiles, 10),
-          maxConstraints: parseInt(opts.maxConstraints, 10),
-          maxExemplars: parseInt(opts.maxExemplars, 10),
+          maxFiles: opts.maxFiles ? parseInt(opts.maxFiles, 10) : undefined,
+          maxConstraints: opts.maxConstraints ? parseInt(opts.maxConstraints, 10) : undefined,
+          maxExemplars: opts.maxExemplars ? parseInt(opts.maxExemplars, 10) : undefined,
         }));
 
         console.log(JSON.stringify(result, null, 2));
       } catch (err) {
         printError('bootstrap', err);
+        process.exitCode = 1;
+      }
+    });
+
+  // --- prompt ---
+  program
+    .command('prompt [file]')
+    .description('Print only the agent-ready Weave-first prompt for a task; infers an entry file when omitted')
+    .requiredOption('-t, --task <task>', 'Task description to bootstrap')
+    .option('-s, --scope <scope>', 'Scope description for relevance filtering')
+    .option('-d, --depth <n>', 'Traversal depth', '2')
+    .option('--max-files <n>', 'Max files in the working set')
+    .option('--max-constraints <n>', 'Max mined constraints')
+    .option('--max-exemplars <n>', 'Max exemplar files')
+    .option('--copy', 'Copy the generated prompt to the clipboard')
+    .action(async (
+      file: string | undefined,
+      opts: {
+        task: string;
+        scope?: string;
+        depth: string;
+        maxFiles?: string;
+        maxConstraints?: string;
+        maxExemplars?: string;
+        copy?: boolean;
+      },
+    ) => {
+      try {
+        const result = await withWeave(weave => weave.bootstrap({
+          task: opts.task,
+          start: file,
+          scope: opts.scope,
+          depth: parseInt(opts.depth, 10),
+          maxFiles: opts.maxFiles ? parseInt(opts.maxFiles, 10) : undefined,
+          maxConstraints: opts.maxConstraints ? parseInt(opts.maxConstraints, 10) : undefined,
+          maxExemplars: opts.maxExemplars ? parseInt(opts.maxExemplars, 10) : undefined,
+        }));
+
+        if (opts.copy) {
+          copyToClipboard(result.prompt);
+          console.log(chalk.green('Copied Weave-first prompt to clipboard.'));
+          return;
+        }
+
+        console.log(result.prompt);
+      } catch (err) {
+        printError('prompt', err);
         process.exitCode = 1;
       }
     });
@@ -400,6 +448,26 @@ export function run(argv: string[]): void {
 function printError(command: string, err: unknown): void {
   const message = err instanceof Error ? err.message : String(err);
   console.error(chalk.red(`Error [${command}]: ${message}`));
+}
+
+function copyToClipboard(text: string): void {
+  const attempts = process.platform === 'darwin'
+    ? [['pbcopy']]
+    : process.platform === 'win32'
+      ? [['clip']]
+      : [['xclip', '-selection', 'clipboard'], ['xsel', '--clipboard', '--input']];
+
+  for (const [command, ...args] of attempts) {
+    const result = spawnSync(command, args, {
+      input: text,
+      encoding: 'utf-8',
+    });
+    if (result.status === 0) {
+      return;
+    }
+  }
+
+  throw new Error('Clipboard copy failed. Re-run without --copy and paste the prompt manually.');
 }
 
 function pad(str: string, width: number): string {

@@ -309,11 +309,12 @@ export class SymbolExtractor {
   ): void {
     const nameNode = node.childForFieldName('name');
     if (!nameNode) return;
+    const kind = nameNode.text.match(/^use[A-Z]/) ? 'composable' : 'function';
 
     nodes.push({
       filePath,
       symbolName: nameNode.text,
-      kind: 'function',
+      kind,
       language,
       lineStart: node.startPosition.row + 1,
       lineEnd: node.endPosition.row + 1,

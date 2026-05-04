@@ -33,7 +33,7 @@ rules:
     description: Detects composable function definitions
     match:
       language: typescript
-      file_pattern: "**/composables/**/*.ts"
+      file_pattern: "**/composables/**/*.{ts,js}"
       pattern: |
         (export_statement
           (function_declaration
@@ -48,7 +48,7 @@ rules:
     description: Detects arrow-function composable exports
     match:
       language: typescript
-      file_pattern: "**/composables/**/*.ts"
+      file_pattern: "**/composables/**/*.{ts,js}"
       pattern: |
         (export_statement
           (lexical_declaration

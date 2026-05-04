@@ -10,7 +10,7 @@
     "test": "vitest run"
   },
   "bin": {
-    "weave-mcp": "dist/index.js"
+    "weave-mcp": "dist/bin.js"
   },
   "dependencies": {
     "@weave/core": "^0.1.0",
