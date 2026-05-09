@@ -189,7 +189,12 @@ export class PluginRunner {
     }
 
     const metadata = edge.metadata
-      ? this.interpolateMetadata(edge.metadata, captures)
+      ? this.enhanceEdgeMetadata(
+        filePath,
+        edge.relationship,
+        this.interpolateMetadata(edge.metadata, captures),
+        captures,
+      )
       : null;
 
     let createdEdges = 0;
@@ -387,6 +392,8 @@ export class PluginRunner {
         policy: 95,
         event: 95,
         listener: 95,
+        service: 95,
+        config_array: 95,
         route_definition: 95,
         composable: 90,
         component: 85,
@@ -465,7 +472,17 @@ export class PluginRunner {
     const fileNodes = this.store.getNodesByFile(this.relPath(filePath));
 
     // Prefer function/method/class nodes (the enclosing symbol)
-    const enclosingKinds = ['function', 'method', 'class', 'action', 'model', 'component', 'composable'];
+    const enclosingKinds = [
+      'function',
+      'method',
+      'class',
+      'action',
+      'model',
+      'service',
+      'config_array',
+      'component',
+      'composable',
+    ];
     const matchLine = Number(captures.get('__match_line__'));
     const enclosing = fileNodes
       .filter(n => enclosingKinds.includes(n.kind))
@@ -571,6 +588,93 @@ export class PluginRunner {
       result[key] = this.resolveValue(value, captures);
     }
     return result;
+  }
+
+  private enhanceEdgeMetadata(
+    filePath: string,
+    relationship: string,
+    metadata: Record<string, unknown>,
+    captures: Captures,
+  ): Record<string, unknown> {
+    if (relationship !== 'renders') {
+      return metadata;
+    }
+
+    const component = captures.get('component');
+    if (!component) {
+      return metadata;
+    }
+
+    const props = this.extractInertiaRenderPropKeys(filePath, component);
+    if (props.length > 0) {
+      metadata.props = props;
+    } else if (metadata.props === '@props') {
+      delete metadata.props;
+    }
+
+    return metadata;
+  }
+
+  private extractInertiaRenderPropKeys(filePath: string, component: string): string[] {
+    let source: string;
+    try {
+      source = this.parser.readSource(filePath);
+    } catch {
+      return [];
+    }
+
+    const escapedComponent = component.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const pattern = new RegExp(`(?:Inertia::render|inertia)\\s*\\(\\s*['"]${escapedComponent}['"]\\s*,\\s*\\[`, 'g');
+    const keys = new Set<string>();
+    for (const match of source.matchAll(pattern)) {
+      const arrayStart = source.indexOf('[', match.index ?? 0);
+      const block = arrayStart >= 0 ? this.extractBalancedBlock(source, arrayStart, '[', ']') : null;
+      if (!block) {
+        continue;
+      }
+      for (const keyMatch of block.matchAll(/['"]([^'"]+)['"]\s*=>/g)) {
+        if (keyMatch[1]) {
+          keys.add(keyMatch[1]);
+        }
+      }
+    }
+
+    return Array.from(keys).slice(0, 40);
+  }
+
+  private extractBalancedBlock(source: string, startIndex: number, open: string, close: string): string | null {
+    let depth = 0;
+    let inString: string | null = null;
+    let escaped = false;
+
+    for (let i = startIndex; i < source.length; i++) {
+      const char = source[i];
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (char === '\\') {
+          escaped = true;
+        } else if (char === inString) {
+          inString = null;
+        }
+        continue;
+      }
+
+      if (char === '"' || char === "'") {
+        inString = char;
+        continue;
+      }
+      if (char === open) {
+        depth++;
+      } else if (char === close) {
+        depth--;
+        if (depth === 0) {
+          return source.slice(startIndex, i + 1);
+        }
+      }
+    }
+
+    return null;
   }
 
   private resolveValue(value: string, captures: Captures): string {

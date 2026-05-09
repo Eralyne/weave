@@ -1,6 +1,6 @@
 name: laravel-core
 version: 1.0.0
-description: Laravel core framework conventions — models, migrations, routes, events, policies, form requests
+description: Laravel core framework conventions — models, migrations, routes, events, policies, form requests, services, config arrays
 
 detect:
   files:
@@ -16,9 +16,136 @@ node_kinds:
   - policy
   - event
   - listener
+  - service
+  - config_array
   - route_definition
 
 rules:
+  - name: service-class
+    description: Laravel service/client/integration classes that act as reusable application services
+    match:
+      language: php
+      file_pattern: "app/{Services,Clients,Integrations}/**/*.php"
+      pattern: |
+        (class_declaration
+          name: (name) @service_name)
+    creates:
+      - node:
+          file: "{current_file}"
+          kind: service
+          metadata:
+            class: "@service_name"
+
+  - name: config-array
+    description: PHP config files that return arrays
+    match:
+      language: php
+      file_pattern: "config/**/*.php"
+      pattern: |
+        (return_statement
+          (array_creation_expression) @config_array)
+    creates:
+      - node:
+          file: "{current_file}"
+          kind: config_array
+          metadata:
+            returns: array
+
+  - name: eloquent-model-class
+    description: Eloquent model classes under app/Models
+    match:
+      language: php
+      file_pattern: "app/Models/**/*.php"
+      pattern: |
+        (class_declaration
+          name: (name) @model_name)
+    creates:
+      - node:
+          file: "{current_file}"
+          kind: model
+          metadata:
+            class: "@model_name"
+
+  - name: migration-schema-change
+    description: Migration files that create or update database tables
+    match:
+      language: php
+      file_pattern: "database/migrations/*.php"
+      pattern: |
+        (scoped_call_expression
+          scope: (name) @_schema (#eq? @_schema "Schema")
+          name: (name) @method (#match? @method "^(create|table)$")
+          arguments: (arguments
+            (argument
+              (string (string_content) @table_name))))
+    creates:
+      - node:
+          file: "{current_file}"
+          kind: migration
+          metadata:
+            table: "@table_name"
+            method: "@method"
+
+  - name: form-request-class
+    description: Laravel FormRequest classes under app/Http/Requests
+    match:
+      language: php
+      file_pattern: "app/Http/Requests/**/*.php"
+      pattern: |
+        (class_declaration
+          name: (name) @request_name)
+    creates:
+      - node:
+          file: "{current_file}"
+          kind: form_request
+          metadata:
+            class: "@request_name"
+
+  - name: policy-class
+    description: Laravel policy classes under app/Policies
+    match:
+      language: php
+      file_pattern: "app/Policies/**/*.php"
+      pattern: |
+        (class_declaration
+          name: (name) @policy_name)
+    creates:
+      - node:
+          file: "{current_file}"
+          kind: policy
+          metadata:
+            class: "@policy_name"
+
+  - name: event-class
+    description: Laravel event classes under app/Events
+    match:
+      language: php
+      file_pattern: "app/Events/**/*.php"
+      pattern: |
+        (class_declaration
+          name: (name) @event_name)
+    creates:
+      - node:
+          file: "{current_file}"
+          kind: event
+          metadata:
+            class: "@event_name"
+
+  - name: listener-class
+    description: Laravel listener classes under app/Listeners
+    match:
+      language: php
+      file_pattern: "app/Listeners/**/*.php"
+      pattern: |
+        (class_declaration
+          name: (name) @listener_name)
+    creates:
+      - node:
+          file: "{current_file}"
+          kind: listener
+          metadata:
+            class: "@listener_name"
+
   - name: route-controller
     description: Route definitions linking URLs to controller classes
     match:

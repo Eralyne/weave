@@ -36,7 +36,8 @@ export class ConventionEngine {
   recompute(): void {
     this.store.clearConventions();
 
-    const allNodes = this.store.getAllNodes();
+    const allNodes = this.store.getAllNodes()
+      .filter(node => !this.isGeneratedPath(node.filePath));
     const nodesByKind = this.groupByKind(allNodes);
 
     const conventions: Convention[] = [];
@@ -54,6 +55,10 @@ export class ConventionEngine {
     }
 
     this.conventionsCache = this.store.getConventions();
+  }
+
+  private isGeneratedPath(filePath: string): boolean {
+    return filePath.startsWith('public/build/') || filePath.startsWith('.weave/');
   }
 
   /**
@@ -160,7 +165,12 @@ export class ConventionEngine {
       ...this.detectLocationPatterns(kind, effectiveNodes, total),
     );
 
-    // 5. Relationship: required edges (every node of kind has edge type X)
+    // 5. Metadata: common plugin-extracted traits, e.g. Vue script setup.
+    conventions.push(
+      ...this.detectMetadataPatterns(kind, effectiveNodes, total),
+    );
+
+    // 6. Relationship: required edges (every node of kind has edge type X)
     conventions.push(
       ...this.detectRelationshipPatterns(kind, effectiveNodes, nodeEdges, total),
     );
@@ -411,6 +421,83 @@ export class ConventionEngine {
   }
 
   /**
+   * Detect common metadata traits produced by plugins and language extractors.
+   */
+  private detectMetadataPatterns(
+    kind: string,
+    nodes: WeaveNode[],
+    total: number,
+  ): Convention[] {
+    const conventions: Convention[] = [];
+    const counts = new Map<string, { frequency: number; key: string; value: string | boolean }>();
+
+    for (const node of nodes) {
+      if (!node.metadata || typeof node.metadata !== 'object') continue;
+      const metadata = node.metadata as Record<string, unknown>;
+      for (const [key, value] of Object.entries(metadata)) {
+        if (typeof value !== 'string' && typeof value !== 'boolean') {
+          continue;
+        }
+        if (value === false || value === 'none' || value === '') {
+          continue;
+        }
+        const countKey = `${key}:${String(value)}`;
+        const existing = counts.get(countKey);
+        counts.set(countKey, {
+          frequency: (existing?.frequency ?? 0) + 1,
+          key,
+          value,
+        });
+      }
+    }
+
+    for (const { frequency, key, value } of counts.values()) {
+      if (frequency >= 2 && frequency / total >= 0.5) {
+        conventions.push({
+          id: 0,
+          kind,
+          property: this.metadataConventionProperty(key, value),
+          frequency,
+          total,
+          confidence: frequency / total,
+          exemplarId: null,
+          metadata: { type: 'metadata', key, value },
+        });
+      }
+    }
+
+    return conventions;
+  }
+
+  private metadataConventionProperty(key: string, value: string | boolean): string {
+    if (key === 'script' && value === 'setup') {
+      return 'uses <script setup>';
+    }
+    if (key === 'hasTemplate' && value === true) {
+      return 'has <template> block';
+    }
+    if (key === 'usesDefineProps' && value === true) {
+      return 'declares props with defineProps';
+    }
+    if (key === 'usesDefineEmits' && value === true) {
+      return 'declares emits with defineEmits';
+    }
+    if (key === 'returnsObject' && value === true) {
+      return 'returns an object API';
+    }
+    if (key === 'usesOnUnmounted' && value === true) {
+      return 'uses onUnmounted lifecycle cleanup';
+    }
+    if (key === 'clearsTimers' && value === true) {
+      return 'clears timers during cleanup';
+    }
+    if (key === 'usesTimers' && value === true) {
+      return 'uses timer-based async behavior';
+    }
+    return `metadata ${key}=${String(value)}`;
+  }
+
+  /**
    * Detect relationship patterns: required edges that most nodes of a kind have.
    * Unlike edge patterns which count relationship types, this checks for the
    * existence of at least one edge of a given relationship type per node.
@@ -609,6 +696,14 @@ export class ConventionEngine {
       case 'location': {
         const directory = meta.directory as string;
         return node.filePath.startsWith(directory);
+      }
+
+      case 'metadata': {
+        if (!node.metadata || typeof node.metadata !== 'object') {
+          return false;
+        }
+        const metadata = node.metadata as Record<string, unknown>;
+        return metadata[meta.key as string] === meta.value;
       }
 
       case 'relationship': {

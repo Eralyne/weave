@@ -135,6 +135,10 @@ export function run(argv: string[]): void {
     .option('--max-files <n>', 'Max files in the working set')
     .option('--max-constraints <n>', 'Max mined constraints')
     .option('--max-exemplars <n>', 'Max exemplar files')
+    .option('--from-spec <file>', 'Path to markdown spec/design doc to seed bootstrap file references')
+    .option('--from-spec-text <markdown>', 'Inline markdown spec/design doc content to seed bootstrap file references')
+    .option('--compact', 'Summarize repeated prompt context (default)')
+    .option('--full', 'Return full diagnostic bootstrap context')
     .action(async (
       file: string | undefined,
       opts: {
@@ -144,13 +148,20 @@ export function run(argv: string[]): void {
         maxFiles?: string;
         maxConstraints?: string;
         maxExemplars?: string;
+        fromSpec?: string;
+        fromSpecText?: string;
+        compact?: boolean;
+        full?: boolean;
       },
     ) => {
       try {
         const result = await withWeave(weave => weave.bootstrap({
           task: opts.task,
           start: file,
+          fromSpec: opts.fromSpec,
+          fromSpecText: opts.fromSpecText,
           scope: opts.scope,
+          compact: opts.full ? false : opts.compact ?? true,
           depth: parseInt(opts.depth, 10),
           maxFiles: opts.maxFiles ? parseInt(opts.maxFiles, 10) : undefined,
           maxConstraints: opts.maxConstraints ? parseInt(opts.maxConstraints, 10) : undefined,
@@ -174,6 +185,10 @@ export function run(argv: string[]): void {
     .option('--max-files <n>', 'Max files in the working set')
     .option('--max-constraints <n>', 'Max mined constraints')
     .option('--max-exemplars <n>', 'Max exemplar files')
+    .option('--from-spec <file>', 'Path to markdown spec/design doc to seed bootstrap file references')
+    .option('--from-spec-text <markdown>', 'Inline markdown spec/design doc content to seed bootstrap file references')
+    .option('--compact', 'Summarize repeated prompt context (default)')
+    .option('--full', 'Return full diagnostic bootstrap context')
     .option('--copy', 'Copy the generated prompt to the clipboard')
     .action(async (
       file: string | undefined,
@@ -184,6 +199,10 @@ export function run(argv: string[]): void {
         maxFiles?: string;
         maxConstraints?: string;
         maxExemplars?: string;
+        fromSpec?: string;
+        fromSpecText?: string;
+        compact?: boolean;
+        full?: boolean;
         copy?: boolean;
       },
     ) => {
@@ -191,7 +210,10 @@ export function run(argv: string[]): void {
         const result = await withWeave(weave => weave.bootstrap({
           task: opts.task,
           start: file,
+          fromSpec: opts.fromSpec,
+          fromSpecText: opts.fromSpecText,
           scope: opts.scope,
+          compact: opts.full ? false : opts.compact ?? true,
           depth: parseInt(opts.depth, 10),
           maxFiles: opts.maxFiles ? parseInt(opts.maxFiles, 10) : undefined,
           maxConstraints: opts.maxConstraints ? parseInt(opts.maxConstraints, 10) : undefined,

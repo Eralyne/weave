@@ -1,9 +1,12 @@
 import { existsSync, readFileSync } from 'node:fs';
-import { extname, join } from 'node:path';
+import { basename, extname, join } from 'node:path';
 import { ConventionEngine } from './engine.js';
 import { toProjectRelative } from '../path-utils.js';
 import type {
   Convention,
+  ValidationRuleCheck,
+  ValidationResult,
+  ValidationSummary,
   ValidationViolation,
   WeaveConfig,
   WeaveNode,
@@ -39,16 +42,28 @@ export class ConventionValidator {
    * Returns violations for nodes that don't satisfy high-confidence conventions.
    */
   validate(filePaths: string[]): ValidationViolation[] {
+    return this.validateWithSummary(filePaths).violations;
+  }
+
+  validateWithSummary(filePaths: string[]): ValidationResult {
     const violations: ValidationViolation[] = [];
+    const checks: ValidationRuleCheck[] = [];
     const semanticState = this.getInertiaSharedPropsState();
+    let checkedNodes = 0;
 
     for (const filePath of filePaths) {
       const relativePath = toProjectRelative(this.projectRoot, filePath);
       const fileNodes = this.store.getNodesByFile(relativePath);
 
       if (fileNodes.length > 0) {
+        checkedNodes += fileNodes.length;
         const fileViolations = this.validateNodes(relativePath, fileNodes);
         violations.push(...fileViolations);
+        checks.push(...this.buildRuleChecks(relativePath, fileNodes, fileViolations));
+      } else {
+        const predictive = this.validatePlannedFile(relativePath);
+        violations.push(...predictive.violations);
+        checks.push(...predictive.checks);
       }
 
       if (semanticState) {
@@ -56,7 +71,192 @@ export class ConventionValidator {
       }
     }
 
-    return violations;
+    return {
+      violations,
+      summary: this.buildSummary(
+        filePaths,
+        checkedNodes,
+        checks.length,
+        violations.length,
+        checks.filter(check => check.status === 'pending').length,
+      ),
+      checks,
+    };
+  }
+
+  private validatePlannedFile(filePath: string): {
+    violations: ValidationViolation[];
+    checks: ValidationRuleCheck[];
+  } {
+    const kind = this.inferKindForPath(filePath);
+    if (!kind) {
+      return { violations: [], checks: [] };
+    }
+
+    const symbol = basename(filePath, extname(filePath));
+    const node: WeaveNode = {
+      id: -1,
+      filePath,
+      symbolName: symbol,
+      kind,
+      language: extname(filePath).replace('.', '') || 'unknown',
+      lineStart: 1,
+      lineEnd: 1,
+      signature: null,
+      metadata: null,
+    };
+    const conventions = this.engine.getConventions(kind)
+      .filter(convention => convention.confidence >= 0.9);
+    const checks: ValidationRuleCheck[] = [];
+    const violations: ValidationViolation[] = [];
+
+    for (const convention of conventions) {
+      const pendingReason = this.predictivePendingReason(convention);
+      const exemplarFile = convention.exemplarId !== null
+        ? this.store.getNodeById(convention.exemplarId)?.filePath ?? null
+        : null;
+
+      if (pendingReason) {
+        checks.push({
+          file: filePath,
+          kind,
+          rule: convention.property,
+          status: 'pending',
+          nodesChecked: 1,
+          violations: 0,
+          confidence: convention.confidence,
+          frequency: convention.frequency,
+          total: convention.total,
+          exemplarFile,
+          predictive: true,
+          reason: pendingReason,
+        });
+        continue;
+      }
+
+      const passes = this.nodeSatisfiesConvention(node, convention);
+      checks.push({
+        file: filePath,
+        kind,
+        rule: convention.property,
+        status: passes ? 'pass' : 'fail',
+        nodesChecked: 1,
+        violations: passes ? 0 : 1,
+        confidence: convention.confidence,
+        frequency: convention.frequency,
+        total: convention.total,
+        exemplarFile,
+        predictive: true,
+      });
+
+      if (!passes) {
+        violations.push({
+          file: filePath,
+          symbol,
+          kind,
+          convention: convention.property,
+          frequency: convention.frequency,
+          total: convention.total,
+          confidence: convention.confidence,
+          exemplarFile,
+          message: `${filePath} is planned as a ${kind} but doesn't ${convention.property}. ${convention.frequency}/${convention.total} ${kind}s do.`,
+        });
+      }
+    }
+
+    return { violations, checks };
+  }
+
+  private inferKindForPath(filePath: string): string | null {
+    if (filePath.startsWith('app/Actions/')) return 'action';
+    if (filePath.startsWith('app/Models/')) return 'model';
+    if (/^app\/(?:Services|Clients|Integrations)\//.test(filePath)) return 'service';
+    if (filePath.startsWith('database/migrations/')) return 'migration';
+    if (filePath.startsWith('config/') && filePath.endsWith('.php')) return 'config_array';
+    if (filePath.startsWith('app/Http/Requests/')) return 'form_request';
+    if (filePath.startsWith('resources/js/Pages/') && filePath.endsWith('.vue')) return 'inertia_page';
+    if (filePath.startsWith('resources/js/Components/') && filePath.endsWith('.vue')) return 'component';
+    if (filePath.startsWith('resources/js/composables/') && /\/use[A-Z].*\.(?:js|ts)$/.test(filePath)) return 'composable';
+    return null;
+  }
+
+  private predictivePendingReason(convention: Convention): string | null {
+    const type = convention.metadata?.type;
+    if (type === 'structural' || type === 'edge_pattern' || type === 'relationship' || type === 'metadata') {
+      return 'Requires indexed code or graph edges; validate again after creating and wiring the file.';
+    }
+    return null;
+  }
+
+  private buildRuleChecks(
+    filePath: string,
+    nodes: WeaveNode[],
+    fileViolations: ValidationViolation[],
+  ): ValidationRuleCheck[] {
+    const checks: ValidationRuleCheck[] = [];
+    const nodesByKind = new Map<string, WeaveNode[]>();
+    for (const node of nodes) {
+      if (node.kind === 'file') {
+        continue;
+      }
+      const existing = nodesByKind.get(node.kind) ?? [];
+      existing.push(node);
+      nodesByKind.set(node.kind, existing);
+    }
+
+    for (const [kind, kindNodes] of nodesByKind.entries()) {
+      const conventions = this.engine.getConventions(kind)
+        .filter(convention => convention.confidence >= 0.9);
+
+      for (const convention of conventions) {
+        const matchingViolations = fileViolations.filter(violation =>
+          violation.kind === kind && violation.convention === convention.property,
+        );
+        const exemplarFile = convention.exemplarId !== null
+          ? this.store.getNodeById(convention.exemplarId)?.filePath ?? null
+          : null;
+
+        checks.push({
+          file: filePath,
+          kind,
+          rule: convention.property,
+          status: matchingViolations.length > 0 ? 'fail' : 'pass',
+          nodesChecked: kindNodes.length,
+          violations: matchingViolations.length,
+          confidence: convention.confidence,
+          frequency: convention.frequency,
+          total: convention.total,
+          exemplarFile,
+        });
+      }
+    }
+
+    return checks;
+  }
+
+  private buildSummary(
+    filePaths: string[],
+    checkedNodes: number,
+    checkedRules: number,
+    violationCount: number,
+    pendingCount: number = 0,
+  ): ValidationSummary {
+    let message: string;
+    if (violationCount > 0) {
+      message = `Checked ${filePaths.length} file(s) against ${checkedRules} high-confidence rule(s); found ${violationCount} violation(s).`;
+    } else if (pendingCount > 0) {
+      message = `Checked ${filePaths.length} file(s) against ${checkedRules} high-confidence rule(s); no failures, ${pendingCount} pending graph-dependent check(s).`;
+    } else {
+      message = `Checked ${filePaths.length} file(s) against ${checkedRules} high-confidence rule(s); all pass.`;
+    }
+
+    return {
+      checkedFiles: filePaths.length,
+      checkedNodes,
+      checkedRules,
+      violations: violationCount,
+      message,
+    };
   }
 
   private validateNodes(
@@ -152,6 +352,14 @@ export class ConventionValidator {
       case 'location': {
         const directory = meta.directory as string;
         return node.filePath.startsWith(directory);
+      }
+
+      case 'metadata': {
+        if (!node.metadata || typeof node.metadata !== 'object') {
+          return false;
+        }
+        const metadata = node.metadata as Record<string, unknown>;
+        return metadata[meta.key as string] === meta.value;
       }
 
       case 'relationship': {

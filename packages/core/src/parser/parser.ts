@@ -19,6 +19,7 @@ const EXTENSION_LANGUAGE_MAP: Record<string, string> = {
   '.jsx': 'javascript',
   '.vue': 'vue',
   '.py': 'python',
+  '.md': 'markdown',
 };
 
 /**

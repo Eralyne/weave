@@ -1,5 +1,7 @@
+import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, extname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { GraphStore } from './graph/store.js';
 import { IndexingDiagnosticsCollector } from './indexing-diagnostics.js';
 import { SubgraphExtractor } from './graph/subgraph.js';
@@ -16,12 +18,22 @@ import type {
   WeaveNode,
   WeaveEdge,
   SubgraphQuery,
+  SubgraphOptions,
   SubgraphResult,
   ContextBundleQuery,
   ContextBundle,
   BootstrapQuery,
   BootstrapPayload,
   BootstrapEntryCandidate,
+  BootstrapExistingFileEdge,
+  BootstrapPatternEvidence,
+  BootstrapPlannedFileExemplar,
+  BootstrapPlannedFilePattern,
+  BootstrapSpecContext,
+  BootstrapSpecLineAnchoredQuery,
+  BootstrapSpecLineReference,
+  BootstrapWarning,
+  QuerySpecContext,
   ContextFile,
   ContextConstraint,
   ContextExemplar,
@@ -29,21 +41,50 @@ import type {
   SubgraphEdge,
   ContextReason,
   ValidationViolation,
+  ValidationResult,
   Convention,
   ConventionPlugin,
   WeaveStatus,
+  IndexingDiagnostics,
 } from './types.js';
 
 type TaskMode = 'implementation' | 'audit_communication' | 'audit_architecture';
 type TaskFocus = 'frontend' | 'backend' | 'mixed' | 'tests';
+type ContextProvenance = ContextReason['provenance'];
 
 interface TaskProfile {
   mode: TaskMode;
   focus: TaskFocus;
   prefersTests: boolean;
   terms: string[];
+  endpointLiterals: string[];
+  specContext: BootstrapSpecContext | null;
   creationLike: boolean;
 }
+
+interface ExemplarOptions {
+  routeMethod?: string;
+  subKind?: string;
+}
+
+interface PlannedFileExemplarCandidate {
+  nodeId: number;
+  file: string;
+  reason: string;
+  confidence: number;
+  coMentionConfidence: number;
+  shapeMatchConfidence: number;
+  confidenceReason: string;
+}
+
+interface IndexerFingerprint {
+  version: number;
+  hash: string;
+  plugins: string[];
+  generatedAt: string;
+}
+
+const INDEXER_FINGERPRINT_VERSION = 2;
 
 /**
  * Main orchestrator. Wires together the graph store, parser, plugin system,
@@ -64,6 +105,7 @@ export class Weave {
   private diagnostics: IndexingDiagnosticsCollector;
   private diagnosticsPath: string;
   private graphPath: string;
+  private fingerprintPath: string;
 
   constructor(private projectRoot: string, config?: Partial<WeaveConfig>) {
     this.config = { monorepo: false, conventionOverrides: [], plugins: [], ...config };
@@ -80,6 +122,7 @@ export class Weave {
     this.diagnostics = new IndexingDiagnosticsCollector();
     this.diagnosticsPath = join(projectRoot, '.weave', 'indexing-diagnostics.json');
     this.graphPath = join(projectRoot, '.weave', 'graph.db');
+    this.fingerprintPath = join(projectRoot, '.weave', 'index-fingerprint.json');
   }
 
   /** Detect frameworks, load plugins, build initial graph. */
@@ -116,6 +159,7 @@ export class Weave {
 
     this.conventionEngine.recompute();
     this.persistDiagnostics();
+    this.persistIndexerFingerprint(this.computeIndexerFingerprint(plugins));
 
     const stats = this.store.getStats();
     return { plugins: plugins.map(p => p.name), ...stats };
@@ -194,6 +238,9 @@ export class Weave {
       );
 
       if (resolvedPairs.length === 0) {
+        if (this.shouldIgnoreUnresolvedL2Edge(edge, details)) {
+          continue;
+        }
         this.diagnostics.recordL2EdgeSkipped(
           relativeFilePath,
           edge.relationship,
@@ -235,10 +282,11 @@ export class Weave {
       ? meta.importedNames.filter((value): value is string => typeof value === 'string')
       : [];
     const sourceFile = meta.sourceFile as string | undefined;
+    const sourceLanguage = this.parser.getLanguage(filePath);
 
     const sourceIds: number[] = [];
     if (sourceSymbol) {
-      const resolved = this.resolveSymbolId(sourceSymbol, localNodes);
+      const resolved = this.resolveSymbolId(sourceSymbol, localNodes, sourceLanguage);
       if (resolved !== undefined) {
         sourceIds.push(resolved);
       }
@@ -248,18 +296,18 @@ export class Weave {
 
     const targetIds = new Set<number>();
     if (targetSymbol) {
-      const resolved = this.resolveSymbolId(targetSymbol, localNodes);
+      const resolved = this.resolveSymbolId(targetSymbol, localNodes, sourceLanguage);
       if (resolved !== undefined) {
         targetIds.add(resolved);
       }
     } else if (importedSymbol) {
-      const resolved = this.resolveSymbolId(importedSymbol, localNodes);
+      const resolved = this.resolveSymbolId(importedSymbol, localNodes, sourceLanguage);
       if (resolved !== undefined) {
         targetIds.add(resolved);
       }
     } else {
       for (const importedName of importedNames) {
-        const resolved = this.resolveSymbolId(importedName, localNodes);
+        const resolved = this.resolveSymbolId(importedName, localNodes, sourceLanguage);
         if (resolved !== undefined) {
           targetIds.add(resolved);
         }
@@ -289,34 +337,194 @@ export class Weave {
     return { pairs };
   }
 
+  private shouldIgnoreUnresolvedL2Edge(
+    edge: Partial<WeaveEdge>,
+    details?: Record<string, unknown>,
+  ): boolean {
+    if (edge.relationship === 'imports') {
+      const imported = String(details?.importedSymbol ?? '');
+      return imported.length > 0 && this.isExternalImportSymbol(imported);
+    }
+
+    if (edge.relationship !== 'calls') {
+      return false;
+    }
+
+    const target = String(details?.targetSymbol ?? details?.importedSymbol ?? '');
+    if (!target) {
+      return false;
+    }
+    if (target.length <= 1) {
+      return true;
+    }
+
+    if (target.includes('.') && !target.includes('::')) {
+      return true;
+    }
+    if (target.includes('().') || target.includes('::factory')) {
+      return true;
+    }
+
+    return this.isKnownExternalCall(target);
+  }
+
+  private isExternalImportSymbol(symbol: string): boolean {
+    if (symbol.startsWith('.')) {
+      return false;
+    }
+
+    return [
+      'Illuminate\\',
+      'Inertia\\',
+      'Laravel\\',
+      'Lorisleiva\\',
+      'Symfony\\',
+      'Carbon\\',
+      'Spatie\\',
+      'Pest\\',
+      'PHPUnit\\',
+      'Vue',
+      '@',
+    ].some(prefix => symbol.startsWith(prefix));
+  }
+
+  private isKnownExternalCall(symbol: string): boolean {
+    const normalized = symbol
+      .replace(/\(.*\)/, '')
+      .split('::')
+      .pop()
+      ?.split('.')
+      .pop()
+      ?.toLowerCase()
+      ?? symbol.toLowerCase();
+    return new Set([
+      'actingas',
+      'array_filter',
+      'array_map',
+      'array_merge',
+      'array_values',
+      'assertsent',
+      'auth',
+      'back',
+      'boolean',
+      'cancelframe',
+      'cancelanimationframe',
+      'cache',
+      'cleartimeout',
+      'collect',
+      'computed',
+      'config',
+      'count',
+      'dd',
+      'delay',
+      'dump',
+      'emit',
+      'empty',
+      'env',
+      'explode',
+      'fetch',
+      'file_get_contents',
+      'filled',
+      'float',
+      'isset',
+      'json_decode',
+      'json_encode',
+      'markraw',
+      'nexttick',
+      'number',
+      'now',
+      'put',
+      'requestanimationframe',
+      'redirect',
+      'ref',
+      'render',
+      'request',
+      'response',
+      'route',
+      'setinterval',
+      'setup',
+      'settimeout',
+      'url',
+      'view',
+      'watch',
+      '__',
+    ]).has(normalized);
+  }
+
   /**
    * Look up a symbol's node ID: first in locally upserted nodes, then in the store.
    */
   private resolveSymbolId(
     symbolName: string,
     localNodes: Map<string, WeaveNode>,
+    sourceLanguage?: string,
   ): number | undefined {
     const local = localNodes.get(symbolName);
     if (local) return local.id;
 
-    const storeNodes = this.store.findNodeBySymbol(symbolName);
+    const storeNodes = this.compatibleSymbolNodes(
+      this.store.findNodeBySymbol(symbolName),
+      sourceLanguage,
+    );
     if (storeNodes.length > 0) return storeNodes[0].id;
 
-    const shortName = this.getShortSymbolName(symbolName);
+    const shortName = symbolName.includes('.') && !symbolName.includes('::')
+      ? symbolName
+      : this.getShortSymbolName(symbolName);
     if (shortName !== symbolName) {
       const localShort = localNodes.get(shortName);
       if (localShort) return localShort.id;
 
-      const shortNodes = this.store.findNodeBySymbol(shortName);
+      const shortNodes = this.compatibleSymbolNodes(
+        this.store.findNodeBySymbol(shortName),
+        sourceLanguage,
+      );
       if (shortNodes.length > 0) return shortNodes[0].id;
     }
 
     return undefined;
   }
 
+  private compatibleSymbolNodes(nodes: WeaveNode[], sourceLanguage?: string): WeaveNode[] {
+    if (!sourceLanguage) {
+      return nodes;
+    }
+    return nodes.filter(node => this.languagesAreCompatible(sourceLanguage, node.language));
+  }
+
+  private languagesAreCompatible(source: string, target: string): boolean {
+    if (source === target) {
+      return true;
+    }
+
+    const frontend = new Set(['javascript', 'typescript', 'jsx', 'tsx', 'vue']);
+    if (frontend.has(source) && frontend.has(target)) {
+      return true;
+    }
+
+    return false;
+  }
+
   /** Subgraph query: minimal connected context for a task. */
   query(query: SubgraphQuery): SubgraphResult {
-    return this.subgraph.extract(query);
+    const specContext = this.specContextForFollowUp(query);
+    const result = this.subgraph.extract(query);
+    const querySpecContext = specContext
+      ? this.buildQuerySpecContext(specContext, this.queryFileReference(query), query.task ?? query.scope ?? query.start)
+      : undefined;
+    if (result.nodes.length > 0 || result.edges.length > 0) {
+      return {
+        ...result,
+        ...(querySpecContext ? { specContext: querySpecContext } : {}),
+        resolution: { file: this.queryFileReference(query), status: 'ok', message: 'Query resolved to indexed graph nodes.' },
+      };
+    }
+
+    return {
+      ...result,
+      ...(querySpecContext ? { specContext: querySpecContext } : {}),
+      resolution: this.describeQueryResolution(query),
+    };
   }
 
   /**
@@ -324,7 +532,16 @@ export class Weave {
    * Returns a minimal working set, short mined constraints, and exemplar files.
    */
   context(query: ContextBundleQuery): ContextBundle {
-    return this.buildContextBundle([query.start], query);
+    const specContext = this.specContextForFollowUp({
+      start: query.start,
+      scope: query.scope,
+      fromSpec: query.fromSpec,
+      fromSpecText: query.fromSpecText,
+    });
+    const taskProfile = (query.scope || specContext)
+      ? this.buildTaskProfile(query.scope ?? query.start, specContext)
+      : undefined;
+    return this.buildContextBundle([query.start], query, taskProfile);
   }
 
   /**
@@ -332,22 +549,34 @@ export class Weave {
    * Intended for wrappers/orchestrators that want to inject Weave invisibly.
    */
   bootstrap(query: BootstrapQuery): BootstrapPayload {
-    const taskProfile = this.buildTaskProfile(query.task);
+    const specInput = query.fromSpecText
+      ?? query.fromSpec
+      ?? this.inferSpecInputFromBootstrapQuery(query);
+    let specContext = specInput ? this.buildSpecContext(specInput) : null;
+    let taskProfile = this.buildTaskProfile(query.task, specContext);
     const entryCandidateLimit = query.maxEntryCandidates
       ?? (taskProfile.mode === 'audit_communication' ? 12 : 3);
-    const defaultMaxFiles = taskProfile.mode === 'audit_communication'
-      ? 12
-      : taskProfile.mode === 'implementation' && taskProfile.focus === 'frontend'
-        ? 5
-        : 8;
-    const entryCandidates = this.buildBootstrapEntryCandidates(query, taskProfile, entryCandidateLimit);
+    let entryCandidates = this.buildBootstrapEntryCandidates(query, taskProfile, entryCandidateLimit);
+    const inferredSpecStart = !specContext && entryCandidates.find(candidate => this.isMarkdownSpecPath(candidate.file));
+    if (inferredSpecStart) {
+      specContext = this.buildSpecContext(inferredSpecStart.file);
+      taskProfile = this.buildTaskProfile(query.task, specContext);
+      entryCandidates = this.buildBootstrapEntryCandidates(query, taskProfile, entryCandidateLimit);
+    }
+    const defaultMaxFiles = specContext
+      ? 16
+      : taskProfile.mode === 'audit_communication'
+        ? 12
+        : taskProfile.mode === 'implementation' && taskProfile.focus === 'frontend'
+          ? 5
+          : 8;
     const start = entryCandidates[0]?.file;
 
     if (!start) {
       throw new Error('Unable to infer a starting file for this task.');
     }
 
-    const context = this.buildContextBundle(
+    let context = this.buildContextBundle(
       entryCandidates.map(candidate => candidate.file),
       {
         start,
@@ -359,6 +588,8 @@ export class Weave {
       },
       taskProfile,
     );
+    context = this.withSpecPlannedFileExemplars(context, specContext, query.maxExemplars ?? 8);
+    const scopeMismatch = this.detectScopeMismatch(taskProfile, context.workingSet);
     const guidance = [
       'Use the workingSet as the initial scope for this task.',
       'Treat workingSet items as explicit graph evidence and verify first-hop facts in code before editing.',
@@ -366,6 +597,12 @@ export class Weave {
       'Treat exemplars as nearby examples to imitate when they fit, not as mandatory templates.',
       'Prefer reusing existing functions, actions, requests, components, and composables in the workingSet before inventing new structures.',
     ];
+    if (this.hasWeakBootstrapEvidence(entryCandidates)) {
+      guidance.push('No strong graph evidence matched the dominant task terms; treat inferred entries as weak fallback and prefer an explicit file or fromSpec input when available.');
+    }
+    if (scopeMismatch) {
+      guidance.push(`Potential scope mismatch: ${scopeMismatch.reason}`);
+    }
     if (taskProfile.mode === 'audit_communication') {
       guidance.push('This is a communication audit task, so the bundle intentionally includes reverse dependents, runtime communication surfaces, and infrastructure wiring.');
     }
@@ -374,14 +611,28 @@ export class Weave {
       'Widen search if explicit graph facts do not hold when inspected in code.',
       'If you widen search, do it narrowly and explain what was missing from the Weave bundle.',
     ];
+    const warnings = this.buildBootstrapWarnings(taskProfile, context.workingSet);
+    const compact = query.compact ?? Boolean(specContext);
+    const payloadSpecContext = compact
+      ? this.compactBootstrapSpecContext(specContext, query)
+      : specContext;
+    const payloadContext = compact
+      ? this.compactBootstrapContext(context, specContext)
+      : context;
 
     return {
       task: query.task,
       start,
       startSource: query.start ? 'provided' : 'inferred',
       taskMode: taskProfile.mode,
+      spec: payloadSpecContext,
+      scopeMismatch,
+      warnings,
       entryCandidates,
-      context,
+      workingSet: payloadContext.workingSet,
+      constraints: payloadContext.constraints,
+      exemplars: payloadContext.exemplars,
+      context: payloadContext,
       operatingMode: 'weave_first',
       guidance,
       fallbackPolicy,
@@ -389,16 +640,19 @@ export class Weave {
         query.task,
         start,
         entryCandidates,
-        context,
+        payloadContext,
         guidance,
         fallbackPolicy,
+        payloadSpecContext,
+        compact,
       ),
     };
   }
 
   /** Get derived conventions for a node kind. */
   conventions(kind?: string): Convention[] {
-    return this.conventionEngine.getConventions(kind);
+    return this.conventionEngine.getConventions(kind ? this.normalizeKindAlias(kind) : undefined)
+      .filter(convention => convention.confidence >= 0.9);
   }
 
   /** Validate files against derived conventions. */
@@ -406,18 +660,49 @@ export class Weave {
     return this.validator.validate(filePaths);
   }
 
+  validateWithSummary(filePaths: string[]): ValidationResult {
+    return this.validator.validateWithSummary(filePaths);
+  }
+
   /** Get the best exemplar for a node kind. */
-  exemplar(kind: string, contextNodeId?: number): {
+  exemplar(kind: string, contextNodeId?: number, options: ExemplarOptions = {}): {
     nodeId: number;
     file: string;
     reason: string;
   } | null {
-    return this.conventionEngine.getExemplar(kind, contextNodeId);
+    const normalizedKind = this.normalizeKindAlias(kind);
+    const filtered = this.getFilteredExemplar(normalizedKind, contextNodeId, options);
+    if (filtered) {
+      return filtered;
+    }
+    if (
+      contextNodeId !== undefined
+      && (normalizedKind === 'component' || normalizedKind === 'inertia_page')
+    ) {
+      return null;
+    }
+    return this.conventionEngine.getExemplar(normalizedKind, contextNodeId);
   }
 
   /** Blast radius: what would be affected by changing a symbol. */
-  impact(fileOrSymbol: string): SubgraphResult {
-    return this.subgraph.impact(fileOrSymbol);
+  impact(fileOrSymbol: string, options: SubgraphQuery['options'] = {}): SubgraphResult {
+    const impactOptions = this.withAutoImpactSummary(fileOrSymbol, options);
+    const result = this.subgraph.impact(fileOrSymbol, impactOptions);
+    const specContext = this.specContextForFollowUp({
+      start: fileOrSymbol,
+      task: impactOptions.task,
+      scope: impactOptions.scope,
+      fromSpec: impactOptions.fromSpec,
+      fromSpecText: impactOptions.fromSpecText,
+    });
+    if (!specContext) {
+      return result;
+    }
+
+    return {
+      ...result,
+      specContext: this.buildQuerySpecContext(specContext, this.toRelativePath(fileOrSymbol), impactOptions.task ?? impactOptions.scope ?? fileOrSymbol),
+    };
   }
 
   /** Graph stats: node/edge counts, plugin status, freshness. */
@@ -437,6 +722,195 @@ export class Weave {
       staleFiles,
       diagnostics,
     };
+  }
+
+  private queryFileReference(query: SubgraphQuery): string {
+    const explicitLineMatch = query.start.match(/^(.+\.(?:php|vue|js|ts|tsx|jsx|py|md|css|scss|json|yaml|yml|sql)):\d+(?:-\d+)?$/);
+    return this.toRelativePath(explicitLineMatch?.[1] ?? query.start);
+  }
+
+  private describeQueryResolution(query: SubgraphQuery): NonNullable<SubgraphResult['resolution']> {
+    const file = this.queryFileReference(query);
+    const content = this.readProjectTextFile(file);
+    if (content === null) {
+      return {
+        file,
+        status: 'missing_file',
+        message: 'No indexed nodes were found because this file does not exist on disk. Treat it as a planned or stale spec reference before querying graph context.',
+      };
+    }
+
+    return {
+      file,
+      status: 'not_indexed',
+      message: 'The file exists on disk, but Weave did not index graph nodes for it. Check file type support, ignore rules, or rerun indexing after plugin changes.',
+    };
+  }
+
+  private specContextForFollowUp(query: Pick<SubgraphQuery, 'start' | 'task' | 'scope' | 'fromSpec' | 'fromSpecText'>): BootstrapSpecContext | null {
+    const specInput = query.fromSpecText
+      ?? query.fromSpec
+      ?? this.inferSpecInputFromFollowUpQuery(query);
+    return specInput ? this.buildSpecContext(specInput) : null;
+  }
+
+  private withAutoImpactSummary(
+    fileOrSymbol: string,
+    options: SubgraphOptions,
+  ): SubgraphOptions {
+    if (
+      options.summary !== undefined
+      || options.maxTokens !== undefined
+      || options.maxNodes !== undefined
+      || options.maxEdges !== undefined
+    ) {
+      return options;
+    }
+
+    const explicitLineMatch = fileOrSymbol.match(/^(.+\.(?:php|vue|js|ts|tsx|jsx|py|md|css|scss|json|yaml|yml|sql)):\d+(?:-\d+)?$/);
+    const file = this.toRelativePath(explicitLineMatch?.[1] ?? fileOrSymbol);
+    const nodes = this.store.getNodesByFile(file);
+    if (nodes.length === 0) {
+      return options;
+    }
+
+    const edgeIds = new Set<number>();
+    for (const node of nodes) {
+      for (const edge of this.store.getEdgesFrom(node.id)) {
+        edgeIds.add(edge.id);
+      }
+      for (const edge of this.store.getEdgesTo(node.id)) {
+        edgeIds.add(edge.id);
+      }
+    }
+
+    if (edgeIds.size < 50) {
+      return options;
+    }
+
+    return {
+      ...options,
+      summary: true,
+    };
+  }
+
+  private inferSpecInputFromFollowUpQuery(query: Pick<SubgraphQuery, 'start' | 'task' | 'scope'>): string | null {
+    if (this.isMarkdownSpecPath(query.start) && this.readProjectTextFile(this.toRelativePath(query.start)) !== null) {
+      return query.start;
+    }
+
+    const text = [query.task, query.scope, query.start].filter(Boolean).join(' ');
+    return this.firstMentionedMarkdownSpecPath(text);
+  }
+
+  private buildQuerySpecContext(
+    specContext: BootstrapSpecContext,
+    startFile: string,
+    queryText: string,
+  ): QuerySpecContext {
+    const terms = this.significantTaskTerms([
+      ...this.extractTaskTerms(queryText),
+      ...this.extractTaskTerms(startFile),
+    ]);
+    const lineFiles = new Set(specContext.lineReferences?.map(reference => reference.file) ?? []);
+    const relatedExistingFiles = [...specContext.existingFiles]
+      .map(file => {
+        let score = 0;
+        if (file === startFile) score += 100;
+        if (lineFiles.has(file)) score += 40;
+        score += this.sharedPathSegmentCount(
+          this.pathSegmentsForSimilarity(startFile),
+          this.pathSegmentsForSimilarity(file),
+        ) * 8;
+        score += this.fileTermMatchScore(file, terms) * 3;
+        return { file, score };
+      })
+      .sort((a, b) => b.score - a.score || a.file.localeCompare(b.file))
+      .slice(0, 12)
+      .map(entry => entry.file);
+
+    const relatedSet = new Set(relatedExistingFiles);
+    const lineAnchoredQueries = (specContext.lineAnchoredQueries ?? [])
+      .filter(query => relatedSet.has(query.file))
+      .slice(0, 12);
+
+    const relatedPlannedFiles = this.relatedPlannedFilesForQuery(
+      specContext.plannedFiles ?? specContext.likelyNewFiles,
+      startFile,
+      terms,
+    );
+    const relatedPlannedSet = new Set(relatedPlannedFiles);
+
+    return {
+      file: specContext.file,
+      digest: this.specContextDigest(specContext),
+      mode: 'summary',
+      note: 'Spec details are summarized for follow-up calls; use digest to correlate with the bootstrap response and call weave_bootstrap for full planned-file evidence.',
+      relatedExistingFiles,
+      lineAnchoredQueries,
+      plannedFiles: relatedPlannedFiles,
+      likelyNewFileExemplars: [],
+      plannedFileExemplarRefs: (specContext.likelyNewFileExemplars ?? [])
+        .filter(exemplar => relatedPlannedSet.has(exemplar.file))
+        .slice(0, 16)
+        .map(exemplar => ({
+          file: exemplar.file,
+          kind: exemplar.kind,
+          exemplarFile: exemplar.exemplarFile,
+          confidence: exemplar.confidence,
+          coMentionConfidence: exemplar.coMentionConfidence,
+          shapeMatchConfidence: exemplar.shapeMatchConfidence,
+          confidenceReason: exemplar.confidenceReason,
+        })),
+      plannedFilePatternRefs: (specContext.plannedFilePatterns ?? [])
+        .filter(pattern => relatedPlannedSet.has(pattern.file))
+        .slice(0, 8)
+        .map(pattern => ({
+          file: pattern.file,
+          kind: pattern.kind,
+          role: pattern.role,
+          status: pattern.status,
+          directExemplarFile: pattern.directExemplarFile,
+          confidence: pattern.confidence,
+      })),
+    };
+  }
+
+  private specContextDigest(specContext: BootstrapSpecContext): string {
+    return createHash('sha256')
+      .update(JSON.stringify({
+        file: specContext.file,
+        referencedFiles: specContext.referencedFiles,
+        plannedFiles: specContext.plannedFiles,
+        existingFiles: specContext.existingFiles,
+      }))
+      .digest('hex')
+      .slice(0, 12);
+  }
+
+  private relatedPlannedFilesForQuery(
+    plannedFiles: string[],
+    startFile: string,
+    terms: string[],
+  ): string[] {
+    const startKind = this.primaryKindForFile(startFile);
+    const startSegments = this.pathSegmentsForSimilarity(startFile);
+    return plannedFiles
+      .map(file => {
+        const kind = this.inferKindForPath(file);
+        let score = this.sharedPathSegmentCount(
+          startSegments,
+          this.pathSegmentsForSimilarity(file),
+        ) * 10;
+        score += this.fileTermMatchScore(file, terms) * 3;
+        if (kind && this.normalizeKindAlias(kind) === this.normalizeKindAlias(startKind)) {
+          score += 30;
+        }
+        return { file, score };
+      })
+      .sort((a, b) => b.score - a.score || a.file.localeCompare(b.file))
+      .slice(0, 6)
+      .map(entry => entry.file);
   }
 
   /** Incremental update: re-index changed files. */
@@ -474,8 +948,15 @@ export class Weave {
   async refresh(): Promise<{ initialized: boolean; updatedFiles: number }> {
     const stats = this.store.getStats();
     const hasGraphData = stats.nodeCount > 0 || stats.edgeCount > 0 || this.store.getAllFileCache().length > 0;
+    const plugins = await this.pluginLoader.detectAndLoad();
+    const currentFingerprint = this.computeIndexerFingerprint(plugins);
 
     if (!existsSync(this.graphPath) || !hasGraphData) {
+      await this.init();
+      return { initialized: true, updatedFiles: 0 };
+    }
+
+    if (!this.isStoredIndexerFingerprintCurrent(currentFingerprint)) {
       await this.init();
       return { initialized: true, updatedFiles: 0 };
     }
@@ -563,7 +1044,7 @@ export class Weave {
     return 'unresolved_edge';
   }
 
-  private getDiagnosticsSnapshot() {
+  private getDiagnosticsSnapshot(): IndexingDiagnostics {
     const current = this.diagnostics.snapshot();
     const hasCurrentData =
       current.files.length > 0
@@ -571,22 +1052,111 @@ export class Weave {
       || current.issues.length > 0;
 
     if (hasCurrentData) {
-      return current;
+      return this.filterDiagnosticsSnapshot(current);
     }
 
     if (!existsSync(this.diagnosticsPath)) {
-      return current;
+      return this.filterDiagnosticsSnapshot(current);
     }
 
     try {
-      return JSON.parse(readFileSync(this.diagnosticsPath, 'utf-8'));
+      return this.filterDiagnosticsSnapshot(JSON.parse(readFileSync(this.diagnosticsPath, 'utf-8')));
     } catch {
-      return current;
+      return this.filterDiagnosticsSnapshot(current);
     }
+  }
+
+  private filterDiagnosticsSnapshot(snapshot: IndexingDiagnostics): IndexingDiagnostics {
+    const files = snapshot.files.filter(file => !this.isGeneratedPath(file.file));
+    const issues = snapshot.issues.filter(issue => !this.isGeneratedPath(issue.file));
+
+    return {
+      ...snapshot,
+      files,
+      issues,
+      totals: {
+        l2EdgesCreated: files.reduce((sum, file) => sum + file.l2EdgesCreated, 0),
+        l2EdgesSkipped: files.reduce((sum, file) => sum + file.l2EdgesSkipped, 0),
+        l3EdgesCreated: files.reduce((sum, file) => sum + file.l3EdgesCreated, 0),
+        l3EdgesSkipped: files.reduce((sum, file) => sum + file.l3EdgesSkipped, 0),
+        nodeCreates: files.reduce((sum, file) => sum + file.nodeCreates, 0),
+        metadataUpdates: files.reduce((sum, file) => sum + file.metadataUpdates, 0),
+        queryErrors: files.reduce((sum, file) => sum + file.queryErrors, 0),
+        issues: issues.length,
+      },
+    };
   }
 
   private persistDiagnostics(): void {
     writeFileSync(this.diagnosticsPath, JSON.stringify(this.diagnostics.snapshot(), null, 2));
+  }
+
+  private computeIndexerFingerprint(plugins: ConventionPlugin[]): IndexerFingerprint {
+    const hash = createHash('sha256');
+    hash.update(JSON.stringify({
+      version: INDEXER_FINGERPRINT_VERSION,
+      config: {
+        monorepo: this.config.monorepo,
+        conventionOverrides: this.config.conventionOverrides,
+        plugins: this.config.plugins,
+      },
+    }));
+
+    for (const file of this.indexerRuntimeFiles()) {
+      hash.update(file);
+      hash.update(readFileSync(file));
+    }
+
+    const pluginPayload = plugins
+      .map(plugin => ({
+        name: plugin.name,
+        version: plugin.version,
+        detect: plugin.detect,
+        nodeKinds: plugin.nodeKinds ?? [],
+        rules: plugin.rules,
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    hash.update(JSON.stringify(pluginPayload));
+
+    return {
+      version: INDEXER_FINGERPRINT_VERSION,
+      hash: hash.digest('hex'),
+      plugins: pluginPayload.map(plugin => `${plugin.name}@${plugin.version}`),
+      generatedAt: new Date().toISOString(),
+    };
+  }
+
+  private indexerRuntimeFiles(): string[] {
+    const modulePath = fileURLToPath(import.meta.url);
+    const moduleDir = dirname(modulePath);
+    const extension = extname(modulePath);
+    return [
+      join(moduleDir, `weave${extension}`),
+      join(moduleDir, 'parser', `symbols${extension}`),
+      join(moduleDir, 'plugins', `runner${extension}`),
+      join(moduleDir, 'plugins', `loader${extension}`),
+      join(moduleDir, 'conventions', `engine${extension}`),
+      join(moduleDir, 'conventions', `validator${extension}`),
+      join(moduleDir, 'graph', `subgraph${extension}`),
+      join(moduleDir, 'cache', `watcher${extension}`),
+    ].filter(file => existsSync(file));
+  }
+
+  private persistIndexerFingerprint(fingerprint: IndexerFingerprint): void {
+    writeFileSync(this.fingerprintPath, `${JSON.stringify(fingerprint, null, 2)}\n`);
+  }
+
+  private isStoredIndexerFingerprintCurrent(current: IndexerFingerprint): boolean {
+    if (!existsSync(this.fingerprintPath)) {
+      return false;
+    }
+
+    try {
+      const stored = JSON.parse(readFileSync(this.fingerprintPath, 'utf-8')) as Partial<IndexerFingerprint>;
+      return stored.version === current.version && stored.hash === current.hash;
+    } catch {
+      return false;
+    }
   }
 
   private buildContextBundle(
@@ -600,7 +1170,7 @@ export class Weave {
 
     return {
       workingSet,
-      constraints: this.buildContextConstraints(result, query, taskProfile),
+      constraints: this.buildContextConstraints(result, query, taskProfile, workingSet),
       exemplars: this.buildContextExemplars(result, workingSet.map(file => file.file), query, taskProfile),
     };
   }
@@ -612,8 +1182,11 @@ export class Weave {
   ): SubgraphResult {
     const nodeMap = new Map<number, SubgraphNode>();
     const edgeMap = new Map<string, SubgraphEdge>();
+    const traversalStarts = taskProfile?.specContext
+      ? Array.from(new Set([...starts, ...taskProfile.specContext.existingFiles]))
+      : starts;
 
-    for (const start of starts) {
+    for (const start of traversalStarts) {
       const results: SubgraphResult[] = [this.subgraph.extract({
         start,
         scope: query.scope,
@@ -625,8 +1198,12 @@ export class Weave {
         },
       })];
 
-      if (taskProfile?.mode === 'audit_communication' || taskProfile?.mode === 'audit_architecture') {
-        results.push(this.subgraph.impact(start));
+      if (
+        taskProfile?.mode === 'audit_communication'
+        || taskProfile?.mode === 'audit_architecture'
+        || taskProfile?.specContext?.existingFiles.includes(start)
+      ) {
+        results.push(this.subgraph.impact(start, { summary: true, maxNodes: 32, maxEdges: 48 }));
       }
 
       for (const result of results) {
@@ -669,7 +1246,7 @@ export class Weave {
       reasons: Map<string, ContextReason>;
       anchors: SubgraphNode[];
       score: number;
-      provenance: 'explicit_graph' | 'task_heuristic';
+      provenance: ContextProvenance;
     }>();
 
     for (const node of filteredNodes) {
@@ -733,6 +1310,8 @@ export class Weave {
       for (const entry of fileEntries.values()) {
         entry.score += this.contextFileTaskBonus(entry.file, taskProfile);
       }
+      this.addSpecContextFiles(fileEntries, taskProfile);
+      this.addEndpointLiteralContextFiles(fileEntries, taskProfile);
       this.addFrontendImplementationContextFiles(fileEntries, taskProfile, primaryStart);
       this.addHeuristicContextFiles(fileEntries, taskProfile, primaryStart);
     }
@@ -745,19 +1324,27 @@ export class Weave {
       const structurallyRelevant = (entry: {
         file: string;
         reasons: Map<string, ContextReason>;
-      }) => startSet.has(entry.file)
+      }) => {
+        const reasons = Array.from(entry.reasons.values());
+        return startSet.has(entry.file)
+        || this.isSpecContextEntry(entry.reasons)
         || entry.reasons.has('primary entry candidate')
         || entry.reasons.has('entry candidate')
         || this.fileTermMatchScore(entry.file, significantTerms) > 0
-        || Array.from(entry.reasons.values()).some(reason =>
+        || reasons.some(reason =>
           reason.text.includes('renders_child')
           || reason.text.includes('uses_composable')
-          || reason.text.startsWith('imported by '),
+          || reason.text.startsWith('imported by ')
+          || reason.text.includes('endpoint')
+          || reason.text.includes('HTTP client')
+          || reason.text.includes('route table'),
         );
+      };
 
       const lowValueFiltered = rankedEntries.filter(entry =>
         !this.isLowValuePrecedent(entry.file, taskProfile.terms)
         || startSet.has(entry.file)
+        || this.isSpecContextEntry(entry.reasons)
         || entry.reasons.has('primary entry candidate')
         || entry.reasons.has('entry candidate')
         || this.fileTermMatchScore(entry.file, significantTerms) > 0,
@@ -774,8 +1361,14 @@ export class Weave {
       const scoreFloor = Math.max(12, (rankedEntries[0]?.score ?? 0) * 0.18);
       const filteredEntries = rankedEntries.filter(entry =>
         startSet.has(entry.file)
+        || this.isSpecContextEntry(entry.reasons)
         || entry.reasons.has('primary entry candidate')
         || entry.reasons.has('entry candidate')
+        || Array.from(entry.reasons.values()).some(reason =>
+          reason.text.includes('endpoint')
+          || reason.text.includes('HTTP client')
+          || reason.text.includes('route table'),
+        )
         || entry.score >= scoreFloor,
       );
       if (filteredEntries.length >= Math.min(maxFiles, 4)) {
@@ -785,37 +1378,55 @@ export class Weave {
 
     return rankedEntries
       .slice(0, maxFiles)
-      .map(entry => ({
-        file: entry.file,
-        kinds: Array.from(entry.kinds).sort(),
-        provenance: entry.provenance,
-        confidence: this.fileEntryConfidence(entry, primaryStart !== null && entry.file === primaryStart),
-        reasons: this.sortReasons(entry.reasons),
-        anchors: entry.anchors
-          .sort((a, b) => this.anchorPriority(b) - this.anchorPriority(a) || a.lines[0] - b.lines[0])
-          .slice(0, 3)
-          .map(node => ({
-            symbol: node.symbol,
-            kind: node.kind,
-            lines: node.lines,
-          })),
-      }));
+      .map(entry => {
+        const isPrimaryStart = primaryStart !== null && entry.file === primaryStart;
+        return {
+          file: entry.file,
+          kind: this.primaryContextKind(entry.file, entry.kinds),
+          kinds: Array.from(entry.kinds).sort(),
+          provenance: entry.provenance,
+          confidence: this.fileEntryConfidence(entry, isPrimaryStart),
+          reasons: this.fileEntryReasons(entry, isPrimaryStart),
+          anchors: entry.anchors
+            .sort((a, b) => this.anchorPriority(b) - this.anchorPriority(a) || a.lines[0] - b.lines[0])
+            .slice(0, 3)
+            .map(node => ({
+              symbol: node.symbol,
+              kind: node.kind,
+              lines: node.lines,
+            })),
+        };
+      });
+  }
+
+  private isSpecContextEntry(reasons: Map<string, ContextReason>): boolean {
+    return reasons.has('provided spec document')
+      || Array.from(reasons.keys()).some(reason => reason.startsWith('listed in spec '));
+  }
+
+  private primaryContextKind(filePath: string, kinds: Iterable<string>): string | null {
+    const ranked = Array.from(kinds)
+      .filter(kind => kind !== 'file')
+      .sort((a, b) => this.bundleKindPriority(b) - this.bundleKindPriority(a));
+
+    return ranked[0] ?? this.inferKindForPath(filePath);
   }
 
   private buildContextConstraints(
     result: SubgraphResult,
     query: ContextBundleQuery,
     taskProfile?: TaskProfile,
+    workingSet: ContextFile[] = [],
   ): ContextConstraint[] {
     const maxConstraints = query.maxConstraints ?? 6;
-    const workingKinds = this.getPreferredContextKinds(result, taskProfile);
+    const workingKinds = this.getPreferredContextKinds(result, taskProfile, workingSet);
 
     const constraints: ContextConstraint[] = [];
     for (const kind of workingKinds) {
       const conventions = this.conventionEngine.getConventions(kind)
-        .filter(convention => convention.confidence >= 0.6)
+        .filter(convention => convention.confidence >= 0.9)
         .sort((a, b) => b.confidence - a.confidence || b.frequency - a.frequency)
-        .slice(0, 1);
+        .slice(0, 3);
 
       for (const convention of conventions) {
         const exemplarFile = convention.exemplarId !== null
@@ -834,6 +1445,7 @@ export class Weave {
           frequency: convention.frequency,
           total: convention.total,
           exemplarFile,
+          plugin: this.pluginForConventionKind(kind),
         });
       }
     }
@@ -904,6 +1516,54 @@ export class Weave {
       .slice(0, maxExemplars);
   }
 
+  private withSpecPlannedFileExemplars(
+    context: ContextBundle,
+    specContext: BootstrapSpecContext | null,
+    maxExemplars: number,
+  ): ContextBundle {
+    const specExemplars = this.specPlannedFileContextExemplars(specContext, maxExemplars);
+    if (specExemplars.length === 0) {
+      return context;
+    }
+
+    const deduped = new Map<string, ContextExemplar>();
+    for (const exemplar of [...specExemplars, ...context.exemplars]) {
+      const key = `${exemplar.plannedFile ?? exemplar.kind}:${exemplar.file}`;
+      if (!deduped.has(key)) {
+        deduped.set(key, exemplar);
+      }
+    }
+
+    return {
+      ...context,
+      exemplars: Array.from(deduped.values()).slice(0, maxExemplars),
+    };
+  }
+
+  private specPlannedFileContextExemplars(
+    specContext: BootstrapSpecContext | null,
+    maxExemplars: number,
+  ): ContextExemplar[] {
+    if (!specContext?.likelyNewFileExemplars?.length) {
+      return [];
+    }
+
+    return specContext.likelyNewFileExemplars
+      .filter(exemplar => exemplar.exemplarFile !== null)
+      .slice(0, maxExemplars)
+      .map(exemplar => ({
+        kind: exemplar.kind ?? 'unknown',
+        file: exemplar.exemplarFile as string,
+        plannedFile: exemplar.file,
+        reason: `planned file ${exemplar.file}: ${exemplar.reason}`,
+        provenance: 'spec_planned_file' as const,
+        confidence: exemplar.confidence,
+        coMentionConfidence: exemplar.coMentionConfidence,
+        shapeMatchConfidence: exemplar.shapeMatchConfidence,
+        nodeId: exemplar.exemplarNodeId ?? 0,
+      }));
+  }
+
   private collectPeerPrecedentExemplars(
     result: SubgraphResult,
     workingFiles: Set<string>,
@@ -916,6 +1576,7 @@ export class Weave {
     ));
     const activeDirectories = new Set(activeFiles.map(file => dirname(file)));
     const importerFiles = new Set<string>();
+    const candidateScores = new Map<string, number>();
 
     for (const file of activeFiles) {
       for (const node of this.store.getNodesByFile(file)) {
@@ -930,11 +1591,15 @@ export class Weave {
           }
 
           importerFiles.add(source.filePath);
+          if (!workingFiles.has(source.filePath) && !this.isLowValuePrecedent(source.filePath, taskProfile.terms)) {
+            const current = candidateScores.get(source.filePath) ?? 0;
+            const relationshipBonus = edge.relationship === 'renders_child' ? 22 : 12;
+            candidateScores.set(source.filePath, current + relationshipBonus + this.bundleKindPriority(source.kind) * 0.05);
+          }
         }
       }
     }
 
-    const candidateScores = new Map<string, number>();
     for (const importerFile of importerFiles) {
       for (const importerNode of this.store.getNodesByFile(importerFile)) {
         for (const edge of this.store.getEdgesFrom(importerNode.id)) {
@@ -1056,7 +1721,7 @@ export class Weave {
       reasons: Map<string, ContextReason>;
       anchors: SubgraphNode[];
       score: number;
-      provenance: 'explicit_graph' | 'task_heuristic';
+      provenance: ContextProvenance;
     }>,
     file: string,
   ) {
@@ -1089,13 +1754,60 @@ export class Weave {
       .slice(0, 3);
   }
 
-  private getPreferredContextKinds(result: SubgraphResult, taskProfile?: TaskProfile): string[] {
+  private fileEntryReasons(
+    entry: {
+      file: string;
+      reasons: Map<string, ContextReason>;
+      provenance: ContextProvenance;
+    },
+    isPrimaryStart: boolean,
+  ): ContextReason[] {
+    const reasons = this.sortReasons(entry.reasons);
+    if (reasons.length > 0) {
+      return reasons;
+    }
+
+    return [{
+      text: isPrimaryStart
+        ? 'primary entry candidate'
+        : entry.provenance === 'explicit_graph'
+          ? 'included by graph traversal'
+          : 'included by task heuristic score',
+      provenance: entry.provenance,
+      confidence: isPrimaryStart ? 1 : entry.provenance === 'explicit_graph' ? 0.75 : 0.72,
+    }];
+  }
+
+  private getPreferredContextKinds(
+    result: SubgraphResult,
+    taskProfile?: TaskProfile,
+    workingSet: ContextFile[] = [],
+  ): string[] {
     const availableKinds = new Set(
       result.nodes
         .filter(node => !this.isGeneratedPath(node.file))
         .map(node => node.kind)
         .filter(kind => kind !== 'file'),
     );
+    for (const file of workingSet) {
+      for (const kind of file.kinds) {
+        if (kind !== 'file' && kind !== 'spec') {
+          availableKinds.add(this.normalizeKindAlias(kind));
+        }
+      }
+      const inferredKind = this.inferKindForPath(file.file);
+      if (inferredKind && inferredKind !== 'file' && inferredKind !== 'spec') {
+        availableKinds.add(inferredKind);
+      }
+    }
+    if (taskProfile?.specContext) {
+      for (const file of taskProfile.specContext.likelyNewFiles) {
+        const inferredKind = this.inferKindForPath(file);
+        if (inferredKind && inferredKind !== 'file' && inferredKind !== 'spec') {
+          availableKinds.add(inferredKind);
+        }
+      }
+    }
 
     if (taskProfile?.mode === 'audit_communication') {
       return Array.from(availableKinds)
@@ -1133,9 +1845,15 @@ export class Weave {
     if (node.kind === 'inertia_page') return 95;
     if (node.kind === 'component') return 90;
     if (node.kind === 'action') return 85;
+    if (node.kind === 'model') return 84;
+    if (node.kind === 'migration') return 83;
+    if (node.kind === 'form_request') return 82;
+    if (node.kind === 'service') return 81;
+    if (node.kind === 'config_array') return 79;
     if (node.kind === 'method') return 80;
     if (node.kind === 'class') return 70;
     if (node.kind === 'function') return 60;
+    if (node.kind === 'spec') return 58;
     return 50;
   }
 
@@ -1159,18 +1877,411 @@ export class Weave {
     return score;
   }
 
+  private getFilteredExemplar(
+    kind: string,
+    contextNodeId: number | undefined,
+    options: ExemplarOptions,
+  ): { nodeId: number; file: string; reason: string } | null {
+    if (kind === 'action' && (options.routeMethod || options.subKind)) {
+      return this.getActionExemplarForRouteShape(options);
+    }
+
+    if (kind === 'component' && options.subKind) {
+      return this.getComponentExemplarForShape(options.subKind);
+    }
+
+    if ((kind === 'component' || kind === 'inertia_page') && contextNodeId !== undefined) {
+      return this.getContextualExemplar(kind, contextNodeId, options);
+    }
+
+    return null;
+  }
+
+  private getContextualExemplar(
+    kind: string,
+    contextNodeId: number,
+    options: ExemplarOptions,
+  ): { nodeId: number; file: string; reason: string } | null {
+    const contextNode = this.store.getNodeById(contextNodeId);
+    if (!contextNode) {
+      return null;
+    }
+
+    const candidates = new Map<number, number>();
+    const addCandidate = (node: WeaveNode, relationship: string, direction: 'incoming' | 'outgoing') => {
+      if (node.filePath === contextNode.filePath || this.isGeneratedPath(node.filePath)) {
+        return;
+      }
+
+      const candidateKind = this.normalizeKindAlias(node.kind);
+      if (candidateKind !== kind && !(kind === 'component' && candidateKind === 'inertia_page')) {
+        return;
+      }
+
+      const source = this.readProjectTextFile(node.filePath) ?? '';
+      const identifier = `${node.symbolName} ${node.filePath}`;
+      const wantsLayout = options.subKind !== undefined
+        && ['layout', 'shell'].includes(options.subKind.toLowerCase());
+      if (!wantsLayout && /layout|shell/i.test(identifier) && source.includes('<slot')) {
+        return;
+      }
+
+      let score = candidates.get(node.id) ?? 0;
+      score += direction === 'outgoing' ? 34 : 24;
+      if (relationship === 'renders_child') score += 24;
+      else if (relationship === 'imports') score += 12;
+      else if (relationship === 'uses_composable') score += 8;
+      if (options.subKind && candidateKind === 'component') {
+        score += this.componentShapeScore(node, options.subKind.toLowerCase());
+      }
+      score += this.sharedPathSegmentCount(
+        this.pathSegmentsForSimilarity(contextNode.filePath),
+        this.pathSegmentsForSimilarity(node.filePath),
+      ) * 4;
+      candidates.set(node.id, score);
+    };
+
+    for (const edge of this.store.getEdgesFrom(contextNodeId)) {
+      if (!['renders_child', 'imports', 'uses_composable'].includes(edge.relationship)) {
+        continue;
+      }
+      const target = this.store.getNodeById(edge.targetId);
+      if (target) {
+        addCandidate(target, edge.relationship, 'outgoing');
+      }
+    }
+
+    for (const edge of this.store.getEdgesTo(contextNodeId)) {
+      if (!['renders_child', 'imports', 'uses_composable'].includes(edge.relationship)) {
+        continue;
+      }
+      const source = this.store.getNodeById(edge.sourceId);
+      if (source) {
+        addCandidate(source, edge.relationship, 'incoming');
+      }
+    }
+
+    const best = Array.from(candidates.entries())
+      .map(([nodeId, score]) => ({ node: this.store.getNodeById(nodeId), score }))
+      .filter((candidate): candidate is { node: WeaveNode; score: number } => Boolean(candidate.node))
+      .sort((a, b) => b.score - a.score || a.node.filePath.localeCompare(b.node.filePath))[0];
+
+    if (!best) {
+      return null;
+    }
+
+    return {
+      nodeId: best.node.id,
+      file: best.node.filePath,
+      reason: `Best ${kind} exemplar connected to ${contextNode.filePath}`,
+    };
+  }
+
+  private getComponentExemplarForShape(
+    subKind: string,
+  ): { nodeId: number; file: string; reason: string } | null {
+    const normalizedSubKind = subKind.toLowerCase();
+    const scored = this.store.getNodesByKind('component')
+      .filter(node => !this.isGeneratedPath(node.filePath))
+      .map(node => ({
+        node,
+        score: this.componentShapeScore(node, normalizedSubKind),
+      }))
+      .filter(candidate => candidate.score > 0)
+      .sort((a, b) => b.score - a.score || a.node.filePath.localeCompare(b.node.filePath));
+
+    const best = scored[0];
+    if (!best) {
+      return null;
+    }
+
+    return {
+      nodeId: best.node.id,
+      file: best.node.filePath,
+      reason: `Best ${subKind} component exemplar by path and component shape`,
+    };
+  }
+
+  private componentShapeScore(node: WeaveNode, subKind: string): number {
+    const file = node.filePath;
+    const identifier = `${node.symbolName} ${file}`;
+    const source = this.readProjectTextFile(file) ?? '';
+    let score = 0;
+
+    if (this.identifierContainsSubKind(identifier, subKind)) {
+      score += 40;
+    }
+
+    if (subKind === 'leaf') {
+      if (file.startsWith('resources/js/Components/')) score += 24;
+      if (file.startsWith('resources/js/Pages/')) score -= 30;
+      if (/layout|shell|page/i.test(identifier)) score -= 24;
+      if (/modal|dialog/i.test(identifier)) score -= 28;
+      if (!source.includes('<slot')) score += 10;
+      if ((node.lineEnd - node.lineStart) <= 180) score += 8;
+    } else if (subKind === 'modal' || subKind === 'dialog') {
+      if (/modal|dialog/i.test(identifier)) score += 24;
+      if (source.includes('<Modal') || source.includes("from '@/Components/Modal") || source.includes('from "@/Components/Modal')) {
+        score += 24;
+      }
+    } else if (subKind === 'layout' || subKind === 'shell') {
+      if (/layout|shell/i.test(identifier)) score += 30;
+      if (source.includes('<slot')) score += 14;
+    } else if (subKind === 'form') {
+      if (/form/i.test(identifier)) score += 20;
+      if (source.includes('useForm') || /<form\b/i.test(source)) score += 20;
+    } else if (subKind === 'table' || subKind === 'list') {
+      if (/table|list|index/i.test(identifier)) score += 18;
+      if (/<table\b|v-for=/i.test(source)) score += 18;
+    }
+
+    return score;
+  }
+
+  private getActionExemplarForRouteShape(
+    options: ExemplarOptions,
+  ): { nodeId: number; file: string; reason: string } | null {
+    const requestedMethods = new Set(
+      [
+        ...(options.routeMethod ? [options.routeMethod] : []),
+        ...this.routeMethodsForSubKind(options.subKind),
+      ]
+        .map(method => method.toUpperCase())
+        .filter(Boolean),
+    );
+    const subKind = options.subKind?.toLowerCase() ?? '';
+    const candidates = this.store.getNodesByKind('action')
+      .filter(node => !this.isGeneratedPath(node.filePath));
+
+    const scored = candidates.map(node => {
+      const routeEdges = this.routeEdgesForFile(node.filePath);
+      let score = this.kindConventionConfidence('action') * 10;
+
+      for (const edge of routeEdges) {
+        const method = String(edge.metadata?.method ?? '').toUpperCase();
+        if (requestedMethods.size > 0 && requestedMethods.has(method)) {
+          score += 40;
+        }
+        if (requestedMethods.size > 0 && requestedMethods.has('MUTATION') && method && method !== 'GET') {
+          score += 32;
+        }
+        if (method === 'GET' && this.subKindLooksReadOnly(subKind)) {
+          score += 24;
+        }
+        if (method && method !== 'GET' && this.subKindLooksMutating(subKind)) {
+          score += 24;
+        }
+      }
+
+      score += this.actionShapeScore(node, options, routeEdges);
+
+      return { node, score, routeEdges };
+    })
+      .filter(candidate => candidate.score > this.kindConventionConfidence('action') * 10)
+      .sort((a, b) => b.score - a.score || a.node.filePath.localeCompare(b.node.filePath));
+
+    const best = scored[0];
+    if (!best) {
+      return null;
+    }
+
+    const methods = Array.from(new Set(
+      best.routeEdges
+        .map(edge => String(edge.metadata?.method ?? '').toUpperCase())
+        .filter(Boolean),
+    )).join(', ');
+
+    return {
+      nodeId: best.node.id,
+      file: best.node.filePath,
+      reason: `Best ${options.subKind ?? options.routeMethod ?? 'route-shaped'} action exemplar${methods ? ` (${methods})` : ''}`,
+    };
+  }
+
+  private actionShapeScore(
+    node: WeaveNode,
+    options: ExemplarOptions,
+    routeEdges: WeaveEdge[] = this.routeEdgesForFile(node.filePath),
+  ): number {
+    const subKind = options.subKind?.toLowerCase() ?? '';
+    const identifier = `${node.symbolName} ${node.filePath}`;
+    const lowerIdentifier = identifier.toLowerCase();
+    const source = this.readProjectTextFile(node.filePath) ?? '';
+    let score = 0;
+
+    if (subKind && this.identifierContainsSubKind(identifier, subKind)) {
+      score += 36;
+    }
+    if (this.subKindLooksReadOnly(subKind) && /(show|index|list|page)/.test(lowerIdentifier)) {
+      score += 14;
+    }
+    if (this.subKindLooksMutating(subKind) && /(create|store|update|delete|patch|post|discover)/.test(lowerIdentifier)) {
+      score += 14;
+    }
+
+    if (source.includes('function handle(') || source.includes('function handle (')) {
+      score += 10;
+    }
+    if (source.includes('function authorize(') || source.includes('function authorize (')) {
+      score += 6;
+    }
+    if (source.includes('Inertia::render')) {
+      score += this.subKindLooksReadOnly(subKind) ? 12 : 4;
+    }
+    if (/ActionRequest|FormRequest/.test(source)) {
+      score += this.subKindLooksMutating(subKind) ? 8 : 2;
+    }
+
+    const requestedMethods = new Set(
+      [
+        ...(options.routeMethod ? [options.routeMethod] : []),
+        ...this.routeMethodsForSubKind(options.subKind),
+      ]
+        .map(method => method.toUpperCase())
+        .filter(Boolean),
+    );
+    for (const edge of routeEdges) {
+      const method = String(edge.metadata?.method ?? '').toUpperCase();
+      if (requestedMethods.has(method)) {
+        score += 18;
+      }
+      if (requestedMethods.has('MUTATION') && method && method !== 'GET') {
+        score += 12;
+      }
+    }
+
+    return score;
+  }
+
+  private getConsumerExemplarForContext(
+    kind: string,
+    contextNodeId: number,
+  ): { nodeId: number; file: string; reason: string } | null {
+    const contextNode = this.store.getNodeById(contextNodeId);
+    if (!contextNode) {
+      return null;
+    }
+
+    const candidates = new Map<number, number>();
+    for (const edge of this.store.getEdgesTo(contextNodeId)) {
+      if (!['renders_child', 'imports', 'uses_composable'].includes(edge.relationship)) {
+        continue;
+      }
+
+      const source = this.store.getNodeById(edge.sourceId);
+      if (!source || source.filePath === contextNode.filePath || this.isGeneratedPath(source.filePath)) {
+        continue;
+      }
+      const sourceKind = this.normalizeKindAlias(source.kind);
+      if (sourceKind !== kind && !(kind === 'component' && sourceKind === 'inertia_page')) {
+        continue;
+      }
+
+      const current = candidates.get(source.id) ?? 0;
+      const relationshipBonus = edge.relationship === 'renders_child' ? 30 : 18;
+      candidates.set(source.id, current + relationshipBonus + this.bundleKindPriority(sourceKind) * 0.05);
+    }
+
+    const best = Array.from(candidates.entries())
+      .map(([nodeId, score]) => ({ node: this.store.getNodeById(nodeId), score }))
+      .filter((candidate): candidate is { node: WeaveNode; score: number } => Boolean(candidate.node))
+      .sort((a, b) => b.score - a.score || a.node.filePath.localeCompare(b.node.filePath))[0];
+
+    if (!best) {
+      return null;
+    }
+
+    return {
+      nodeId: best.node.id,
+      file: best.node.filePath,
+      reason: `Best consumer exemplar for ${contextNode.filePath}`,
+    };
+  }
+
+  private routeEdgesForFile(filePath: string): WeaveEdge[] {
+    const routeEdges: WeaveEdge[] = [];
+    for (const node of this.store.getNodesByFile(filePath)) {
+      for (const edge of [...this.store.getEdgesFrom(node.id), ...this.store.getEdgesTo(node.id)]) {
+        if (edge.relationship === 'routes_to') {
+          routeEdges.push(edge);
+        }
+      }
+    }
+    return routeEdges;
+  }
+
+  private routeMethodsForSubKind(subKind: string | undefined): string[] {
+    const normalized = subKind?.toLowerCase();
+    if (!normalized) {
+      return [];
+    }
+    if (this.subKindLooksReadOnly(normalized)) {
+      return ['GET'];
+    }
+    if (this.subKindLooksMutating(normalized)) {
+      return ['MUTATION', 'POST', 'PATCH', 'PUT', 'DELETE'];
+    }
+    return [];
+  }
+
+  private subKindLooksReadOnly(subKind: string): boolean {
+    return ['show', 'index', 'list', 'read', 'get', 'page', 'render'].includes(subKind);
+  }
+
+  private subKindLooksMutating(subKind: string): boolean {
+    return ['create', 'store', 'update', 'delete', 'mutation', 'post', 'patch', 'put'].includes(subKind);
+  }
+
+  private identifierContainsSubKind(value: string, subKind: string): boolean {
+    const normalized = value
+      .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+      .replace(/[\\/_.-]/g, ' ')
+      .toLowerCase();
+    return normalized.split(/\s+/).includes(subKind.toLowerCase());
+  }
+
   private primaryKindForFile(filePath: string): string {
     const nodes = this.store.getNodesByFile(filePath)
       .filter(node => node.kind !== 'file')
       .sort((a, b) => this.bundleKindPriority(b.kind) - this.bundleKindPriority(a.kind) || a.lineStart - b.lineStart);
 
-    return nodes[0]?.kind ?? 'file';
+    return nodes[0]?.kind ?? this.inferKindForPath(filePath) ?? 'file';
+  }
+
+  private inferKindForPath(filePath: string): string | null {
+    if (filePath.startsWith('app/Actions/')) return 'action';
+    if (filePath.startsWith('app/Models/')) return 'model';
+    if (/^app\/(?:Services|Clients|Integrations)\//.test(filePath)) return 'service';
+    if (filePath.startsWith('database/migrations/')) return 'migration';
+    if (filePath.startsWith('config/') && filePath.endsWith('.php')) return 'config_array';
+    if (filePath.startsWith('app/Http/Requests/')) return 'form_request';
+    if (filePath.startsWith('resources/js/Pages/') && filePath.endsWith('.vue')) return 'inertia_page';
+    if (filePath.startsWith('resources/js/Components/') && filePath.endsWith('.vue')) return 'component';
+    if (filePath.startsWith('resources/js/composables/') && /\/use[A-Z].*\.(?:js|ts)$/.test(filePath)) return 'composable';
+    if (filePath.startsWith('routes/')) return 'route_definition';
+    if (filePath.endsWith('.md')) return 'spec';
+    return null;
   }
 
   private bundleKindPriority(kind: string): number {
     switch (kind) {
       case 'action':
         return 100;
+      case 'model':
+        return 98;
+      case 'service':
+        return 97;
+      case 'migration':
+        return 96;
+      case 'config_array':
+        return 95;
+      case 'form_request':
+        return 94;
+      case 'policy':
+        return 92;
+      case 'event':
+      case 'listener':
+        return 90;
       case 'inertia_page':
         return 95;
       case 'component':
@@ -1185,6 +2296,8 @@ export class Weave {
         return 58;
       case 'export':
         return 52;
+      case 'spec':
+        return 51;
       default:
         return 50;
     }
@@ -1194,6 +2307,14 @@ export class Weave {
     switch (kind) {
       case 'action':
         return 100;
+      case 'model':
+        return 98;
+      case 'service':
+        return 97;
+      case 'migration':
+        return 97;
+      case 'config_array':
+        return 95;
       case 'composable':
         return 96;
       case 'inertia_page':
@@ -1217,15 +2338,18 @@ export class Weave {
     entry: {
       reasons: Map<string, ContextReason>;
       score: number;
-      provenance: 'explicit_graph' | 'task_heuristic';
+      provenance: ContextProvenance;
     },
     isStart: boolean,
   ): number {
     if (isStart) return 1;
-    if (entry.provenance === 'task_heuristic') {
-      return 0.72;
-    }
     const bestReason = Math.max(...Array.from(entry.reasons.values()).map(reason => reason.confidence), 0.75);
+    if (entry.provenance === 'spec_reference') {
+      return Math.min(0.98, Math.max(0.9, bestReason));
+    }
+    if (entry.provenance === 'task_heuristic') {
+      return Math.min(0.9, Math.max(0.72, bestReason));
+    }
     return Math.min(0.98, Math.max(0.75, bestReason));
   }
 
@@ -1237,15 +2361,111 @@ export class Weave {
   }
 
   private kindConventionConfidence(kind: string): number {
-    const conventions = this.conventionEngine.getConventions(kind);
+    const conventions = this.conventionEngine.getConventions(this.normalizeKindAlias(kind));
     if (conventions.length === 0) {
       return 0.7;
     }
     return conventions.reduce((best, convention) => Math.max(best, convention.confidence), 0.7);
   }
 
+  private pluginForConventionKind(kind: string): string | null {
+    switch (this.normalizeKindAlias(kind)) {
+      case 'action':
+        return 'laravel-actions';
+      case 'model':
+      case 'migration':
+      case 'form_request':
+      case 'service':
+      case 'config_array':
+        return 'laravel-core';
+      case 'inertia_page':
+        return 'inertia';
+      case 'component':
+      case 'composable':
+      case 'vue_template':
+      case 'vue_script':
+        return 'vue-composition';
+      default:
+        return null;
+    }
+  }
+
+  private normalizeKindAlias(kind: string): string {
+    const normalized = kind.toLowerCase();
+    if (['page', 'inertia-page', 'inertia_page', 'vue_page'].includes(normalized)) {
+      return 'inertia_page';
+    }
+    if (['request', 'form-request', 'form_request'].includes(normalized)) {
+      return 'form_request';
+    }
+    return kind;
+  }
+
   private isGeneratedPath(filePath: string): boolean {
     return filePath.startsWith('public/build/') || filePath.startsWith('.weave/');
+  }
+
+  private isBootstrapNoisePath(filePath: string): boolean {
+    return filePath === 'public/index.php';
+  }
+
+  private compactBootstrapContext(
+    context: ContextBundle,
+    specContext: BootstrapSpecContext | null,
+  ): ContextBundle {
+    return {
+      workingSet: context.workingSet.map(file => ({
+        ...file,
+        reasons: file.reasons.slice(0, 3),
+        anchors: file.anchors.slice(0, 2),
+      })),
+      constraints: context.constraints.slice(0, 6),
+      exemplars: context.exemplars.slice(0, specContext?.likelyNewFileExemplars?.length ? 8 : 3),
+    };
+  }
+
+  private compactBootstrapSpecContext(
+    specContext: BootstrapSpecContext | null,
+    query: BootstrapQuery,
+  ): BootstrapSpecContext | null {
+    if (!specContext) {
+      return null;
+    }
+
+    const fileLimit = query.maxFiles ?? 10;
+    const exemplarLimit = query.maxExemplars ?? 8;
+    const referenceLimit = Math.max(12, Math.min(24, fileLimit * 2));
+    const edgeSummaryLimit = Math.min(fileLimit, 8);
+    const edgeLimit = 2;
+
+    return {
+      ...specContext,
+      referencedFiles: specContext.referencedFiles.slice(0, referenceLimit),
+      lineReferences: specContext.lineReferences?.slice(0, fileLimit),
+      lineAnchoredQueries: specContext.lineAnchoredQueries?.slice(0, fileLimit),
+      existingFileEdges: specContext.existingFileEdges
+        ?.slice(0, edgeSummaryLimit)
+        .map(summary => ({
+          ...summary,
+          edges: summary.edges.slice(0, edgeLimit),
+          omittedEdges: summary.omittedEdges ?? Math.max(0, (summary.totalEdges ?? summary.edges.length) - Math.min(edgeLimit, summary.edges.length)),
+        })),
+      existingFiles: specContext.existingFiles.slice(0, fileLimit),
+      existingTargets: specContext.existingTargets?.slice(0, fileLimit),
+      missingFiles: specContext.missingFiles.slice(0, referenceLimit),
+      likelyNewFiles: specContext.likelyNewFiles.slice(0, referenceLimit),
+      plannedFiles: specContext.plannedFiles?.slice(0, referenceLimit),
+      staleSpecRefs: specContext.staleSpecRefs?.slice(0, referenceLimit),
+      // This is the implementation manifest. Do not silently truncate it:
+      // omitted planned files look like Weave has no opinion, which is exactly
+      // the failure mode bootstrap is supposed to prevent.
+      likelyNewFileExemplars: specContext.likelyNewFileExemplars,
+      plannedFilePatterns: specContext.plannedFilePatterns?.slice(0, exemplarLimit),
+      suspiciousReferences: specContext.suspiciousReferences.slice(0, referenceLimit),
+      novelPathPrefixes: specContext.novelPathPrefixes.slice(0, fileLimit),
+      terms: specContext.terms?.slice(0, 24),
+      termIndex: undefined,
+    };
   }
 
   private buildBootstrapPrompt(
@@ -1255,14 +2475,97 @@ export class Weave {
     context: ContextBundle,
     guidance: string[],
     fallbackPolicy: string[],
+    specContext: BootstrapSpecContext | null = null,
+    compact = false,
   ): string {
+    const omitGenericExemplars = Boolean(specContext?.likelyNewFileExemplars?.length);
+    const promptContext = omitGenericExemplars
+      ? { ...context, exemplars: [] }
+      : context;
+    const contextPayload = compact
+      ? {
+	          workingSet: promptContext.workingSet.map(file => ({
+	            file: file.file,
+	            kind: file.kind,
+	            kinds: file.kinds,
+	            confidence: file.confidence,
+	            reasons: file.reasons.map(reason => reason.text),
+          })),
+          constraints: promptContext.constraints.map(constraint => ({
+            kind: constraint.kind,
+	            rule: constraint.rule,
+	            plugin: constraint.plugin,
+	            confidence: constraint.confidence,
+	            frequency: `${constraint.frequency}/${constraint.total}`,
+	          })),
+		          exemplars: promptContext.exemplars.map(exemplar => ({
+		            kind: exemplar.kind,
+		            file: exemplar.file,
+		            plannedFile: exemplar.plannedFile,
+		            confidence: exemplar.confidence,
+		            shapeMatchConfidence: exemplar.shapeMatchConfidence,
+		            coMentionConfidence: exemplar.coMentionConfidence,
+		            reason: exemplar.reason,
+		          })),
+          specDigest: specContext ? this.specContextDigest(specContext) : null,
+        }
+      : promptContext;
+
     return [
       'You are operating in Weave-first mode.',
       `Task: ${task}`,
       `Entry file: ${start}`,
+      ...(specContext
+	        ? [
+	            `Spec file: ${specContext.file}`,
+	            `Spec digest: ${this.specContextDigest(specContext)}`,
+	            `Spec existing references: ${specContext.existingFiles.length}`,
+            `Spec missing/new references: ${specContext.missingFiles.length}`,
+            ...(specContext.lineAnchoredQueries?.length
+              ? [
+                  'Spec line-anchored query targets:',
+                  ...specContext.lineAnchoredQueries.slice(0, 8).map(query =>
+                    `- weave_query ${query.query}`,
+                  ),
+                ]
+              : []),
+            ...(specContext.likelyNewFileExemplars?.length
+	              ? [
+	                  'Spec planned-file exemplars:',
+	                  ...specContext.likelyNewFileExemplars.slice(0, 8).map(exemplar =>
+	                    `- ${exemplar.file} (${exemplar.kind ?? 'unknown'}): ${exemplar.exemplarFile ?? 'no exemplar'}; shape=${this.formatConfidence(exemplar.shapeMatchConfidence)} coMention=${this.formatConfidence(exemplar.coMentionConfidence)}`,
+	                  ),
+	                ]
+              : []),
+            ...(specContext.plannedFilePatterns?.length
+              ? [
+                  'Spec planned-file pattern evidence:',
+                  ...specContext.plannedFilePatterns.slice(0, 8).map(pattern =>
+                    `- ${pattern.file} (${pattern.role?.primary ?? pattern.kind ?? 'unknown'}): ${pattern.status}; ${pattern.notes.join(' ')}`,
+                  ),
+                ]
+              : []),
+            ...(specContext.existingFileEdges?.length
+              ? [
+                  'Spec existing-file graph edges:',
+                  ...specContext.existingFileEdges.slice(0, 8).map(summary =>
+                    `- ${summary.file}: ${summary.edges.slice(0, 3).map(edge =>
+                      `${edge.direction} ${edge.relationship} ${edge.direction === 'outgoing' ? `to ${edge.targetFile}` : `from ${edge.sourceFile}`}`,
+                    ).join('; ')}`,
+                  ),
+                ]
+              : []),
+            ...(omitGenericExemplars
+              ? ['Generic context exemplars omitted from this prompt because spec planned-file exemplars are more specific.']
+              : []),
+          ]
+        : []),
       '',
       'Inferred entry candidates:',
       ...entryCandidates.map(candidate => `- ${candidate.file} (${Math.round(candidate.confidence * 100)}%): ${candidate.reasons.join('; ')}`),
+      ...(specContext?.novelPathPrefixes.length
+        ? ['', 'Spec path warnings:', ...specContext.novelPathPrefixes.map(prefix => `- New path prefix: ${prefix}`)]
+        : []),
       '',
       'Use the following context bundle as your initial working set.',
       'Do not broaden repo exploration unless the fallback policy applies.',
@@ -1274,8 +2577,1382 @@ export class Weave {
       ...fallbackPolicy.map(item => `- ${item}`),
       '',
       'Context bundle:',
-      JSON.stringify(context, null, 2),
+      compact ? JSON.stringify(contextPayload) : JSON.stringify(contextPayload, null, 2),
     ].join('\n');
+  }
+
+  private buildSpecContext(specInput: string): BootstrapSpecContext {
+    const specSource = this.resolveSpecInput(specInput);
+    const { file, content } = specSource;
+
+    const specReferences = this.extractSpecReferences(content, file);
+    const referencedFiles = this.dedupeDefaultInferredSpecReferences(specReferences.files);
+    const lineReferences = specReferences.lineReferences;
+    const lineAnchoredQueries = this.buildLineAnchoredQueries(lineReferences);
+    const existingFiles: string[] = [];
+    const missingFiles: string[] = [];
+    const likelyNewFiles: string[] = [];
+    const suspiciousReferences: string[] = [];
+
+    for (const referencedFile of referencedFiles) {
+      if (existsSync(join(this.projectRoot, referencedFile))) {
+        existingFiles.push(referencedFile);
+      } else if (this.looksLikeProjectFilePath(referencedFile)) {
+        likelyNewFiles.push(referencedFile);
+        missingFiles.push(referencedFile);
+      } else {
+        suspiciousReferences.push(referencedFile);
+        missingFiles.push(referencedFile);
+      }
+    }
+
+    const contextualBareReferences = this.contextualBareSpecReferences(
+      suspiciousReferences,
+      [...existingFiles, ...likelyNewFiles],
+    );
+    const actionableSuspiciousReferences = suspiciousReferences
+      .filter(file => !contextualBareReferences.has(file));
+    const actionableMissingFiles = missingFiles
+      .filter(file => !contextualBareReferences.has(file));
+    const novelPathPrefixes = this.findNovelPathPrefixes(likelyNewFiles);
+    const termIndex = this.significantTaskTerms(this.extractTaskTerms(content));
+    const terms = termIndex.slice(0, 40);
+    const likelyNewFileExemplars = this.buildLikelyNewFileExemplars(likelyNewFiles, existingFiles);
+    const plannedFilePatterns = this.buildPlannedFilePatterns(likelyNewFiles, likelyNewFileExemplars);
+    const existingFileEdges = this.buildExistingFileEdgeSummaries(existingFiles);
+
+    const context: BootstrapSpecContext = {
+      file,
+      referencedFiles,
+      lineReferences,
+      lineAnchoredQueries,
+      existingFileEdges,
+      existingFiles,
+      existingTargets: existingFiles,
+      missingFiles: actionableMissingFiles,
+      likelyNewFiles,
+      plannedFiles: likelyNewFiles,
+      staleSpecRefs: actionableSuspiciousReferences,
+      likelyNewFileExemplars,
+      plannedFilePatterns,
+      suspiciousReferences: actionableSuspiciousReferences,
+      novelPathPrefixes,
+      terms,
+    };
+
+    Object.defineProperty(context, 'termIndex', {
+      value: termIndex,
+      enumerable: false,
+    });
+
+    return context;
+  }
+
+  private buildLineAnchoredQueries(
+    lineReferences: BootstrapSpecLineReference[],
+  ): BootstrapSpecLineAnchoredQuery[] {
+    return lineReferences.map(reference => ({
+      file: reference.file,
+      lineStart: reference.lineStart,
+      ...(reference.lineEnd ? { lineEnd: reference.lineEnd } : {}),
+      query: `${reference.file}:${reference.lineStart}${reference.lineEnd ? `-${reference.lineEnd}` : ''}`,
+    }));
+  }
+
+  private buildExistingFileEdgeSummaries(files: string[]): BootstrapSpecContext['existingFileEdges'] {
+    return files
+      .map(file => {
+        const nodes = this.store.getNodesByFile(file);
+        const edges = this.collectFileEdgeSummaries(nodes);
+        const visibleEdges = edges.slice(0, 8);
+        return {
+          file,
+          edges: visibleEdges,
+          totalEdges: edges.length,
+          omittedEdges: Math.max(0, edges.length - visibleEdges.length),
+        };
+      })
+      .filter(summary => summary.edges.length > 0);
+  }
+
+  private collectFileEdgeSummaries(nodes: WeaveNode[]): BootstrapExistingFileEdge[] {
+    const summaries = new Map<string, { edge: BootstrapExistingFileEdge; priority: number }>();
+    const nodeIds = new Set(nodes.map(node => node.id));
+
+    for (const node of nodes) {
+      for (const edge of this.store.getEdgesFrom(node.id)) {
+        const target = this.store.getNodeById(edge.targetId);
+        if (!target || this.isGeneratedPath(target.filePath)) continue;
+        this.addEdgeSummary(summaries, edge, node, target, 'outgoing', nodeIds);
+      }
+      for (const edge of this.store.getEdgesTo(node.id)) {
+        const source = this.store.getNodeById(edge.sourceId);
+        if (!source || this.isGeneratedPath(source.filePath)) continue;
+        this.addEdgeSummary(summaries, edge, source, node, 'incoming', nodeIds);
+      }
+    }
+
+    return Array.from(summaries.values())
+      .sort((a, b) => b.priority - a.priority || a.edge.relationship.localeCompare(b.edge.relationship))
+      .map(entry => entry.edge);
+  }
+
+  private addEdgeSummary(
+    summaries: Map<string, { edge: BootstrapExistingFileEdge; priority: number }>,
+    edge: WeaveEdge,
+    source: WeaveNode,
+    target: WeaveNode,
+    direction: 'incoming' | 'outgoing',
+    fileNodeIds: Set<number>,
+  ): void {
+    if (source.filePath === target.filePath) {
+      return;
+    }
+
+    const key = `${direction}:${edge.relationship}:${source.filePath}:${source.symbolName}:${target.filePath}:${target.symbolName}`;
+    const summary: BootstrapExistingFileEdge = {
+      direction,
+      relationship: edge.relationship,
+      convention: edge.convention,
+      sourceFile: source.filePath,
+      sourceSymbol: source.symbolName,
+      sourceKind: source.kind,
+      targetFile: target.filePath,
+      targetSymbol: target.symbolName,
+      targetKind: target.kind,
+    };
+    const metadata = this.edgeMetadataPreview(edge.metadata);
+    if (metadata && Object.keys(metadata).length > 0) {
+      summary.metadata = metadata;
+    }
+
+    const priority = this.edgeSummaryPriority(edge, source, target, fileNodeIds);
+    const existing = summaries.get(key);
+    if (!existing || priority > existing.priority) {
+      summaries.set(key, { edge: summary, priority });
+    }
+  }
+
+  private edgeSummaryPriority(
+    edge: WeaveEdge,
+    source: WeaveNode,
+    target: WeaveNode,
+    fileNodeIds: Set<number>,
+  ): number {
+    const relationshipPriority: Record<string, number> = {
+      renders: 100,
+      routes_to: 96,
+      shares_data: 92,
+      navigates_to: 86,
+      renders_child: 82,
+      uses_composable: 78,
+      imports: 70,
+      belongs_to: 66,
+      has_many: 66,
+      belongs_to_many: 66,
+      calls: 58,
+    };
+    let score = relationshipPriority[edge.relationship] ?? 40;
+    if (edge.convention) score += 4;
+    if (fileNodeIds.has(source.id) || fileNodeIds.has(target.id)) score += 2;
+    if (source.kind === 'file' || target.kind === 'file') score -= 4;
+    return score;
+  }
+
+  private edgeMetadataPreview(metadata: Record<string, unknown> | null): Record<string, unknown> | undefined {
+    if (!metadata) {
+      return undefined;
+    }
+
+    const preview: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(metadata)) {
+      if (value === null || value === undefined) continue;
+      if (key === 'props' && typeof value === 'string') {
+        const propKeys = this.extractPhpArrayKeys(value);
+        preview[key] = propKeys.length > 0 ? propKeys : this.truncateMetadataString(value);
+        continue;
+      }
+      preview[key] = typeof value === 'string' ? this.truncateMetadataString(value) : value;
+    }
+    return preview;
+  }
+
+  private formatConfidence(value: number | undefined): string {
+    return value === undefined ? 'n/a' : value.toFixed(2);
+  }
+
+  private extractPhpArrayKeys(value: string): string[] {
+    const keys = new Set<string>();
+    for (const match of value.matchAll(/['"]([^'"]+)['"]\s*=>/g)) {
+      keys.add(match[1]);
+    }
+    return Array.from(keys).slice(0, 20);
+  }
+
+  private truncateMetadataString(value: string): string {
+    const compact = value.replace(/\s+/g, ' ').trim();
+    return compact.length > 160 ? `${compact.slice(0, 157)}...` : compact;
+  }
+
+  private buildLikelyNewFileExemplars(
+    files: string[],
+    specExistingFiles: string[] = [],
+  ): BootstrapPlannedFileExemplar[] {
+    return files.map(file => {
+      const kind = this.inferKindForPath(file);
+      if (!kind) {
+	        return {
+	          file,
+	          kind: null,
+	          exemplarFile: null,
+	          exemplarNodeId: null,
+	          reason: 'No kind inferred from planned file path.',
+	          confidence: 0,
+	          coMentionConfidence: 0,
+	          shapeMatchConfidence: 0,
+	          confidenceReason: 'No planned-file kind could be inferred from the path.',
+	        };
+	      }
+
+      const exemplar = this.exemplarForPlannedFile(file, kind, specExistingFiles);
+      if (!exemplar) {
+	        return {
+	          file,
+	          kind,
+	          exemplarFile: null,
+	          exemplarNodeId: null,
+	          reason: `No indexed exemplar found for planned ${kind}.`,
+	          confidence: 0.35,
+	          coMentionConfidence: 0,
+	          shapeMatchConfidence: 0,
+	          confidenceReason: 'No indexed shape exemplar was found; confidence reflects an evidence gap.',
+	        };
+	      }
+
+      return {
+        file,
+        kind,
+	        exemplarFile: exemplar.file,
+	        exemplarNodeId: exemplar.nodeId,
+	        reason: exemplar.reason,
+	        confidence: exemplar.confidence,
+	        coMentionConfidence: exemplar.coMentionConfidence,
+	        shapeMatchConfidence: exemplar.shapeMatchConfidence,
+	        confidenceReason: exemplar.confidenceReason,
+	      };
+    });
+  }
+
+  private buildPlannedFilePatterns(
+    files: string[],
+    exemplars: BootstrapPlannedFileExemplar[],
+  ): BootstrapPlannedFilePattern[] {
+    const exemplarByFile = new Map(exemplars.map(exemplar => [exemplar.file, exemplar]));
+    return files
+      .map(file => {
+        const kind = this.inferKindForPath(file);
+        if (kind === 'service') {
+          return this.buildServicePatternSummary(file, exemplarByFile.get(file));
+        }
+        return null;
+      })
+      .filter((pattern): pattern is BootstrapPlannedFilePattern => pattern !== null);
+  }
+
+  private buildServicePatternSummary(
+    file: string,
+    exemplar?: BootstrapPlannedFileExemplar,
+  ): BootstrapPlannedFilePattern {
+    const role = this.serviceRoleForFile(file);
+    const directExemplarFile = exemplar?.exemplarFile ?? null;
+    const constructionPatterns = this.serviceConstructionEvidence();
+    const configPatterns = this.serviceConfigEvidence(role);
+    const usageExamples = this.serviceUsageEvidence(role, directExemplarFile);
+    const adjacentEvidenceCount = constructionPatterns.length + configPatterns.length + usageExamples.length;
+    const hasDirectExemplar = Boolean(directExemplarFile);
+    const status = hasDirectExemplar
+      ? 'direct_exemplar'
+      : adjacentEvidenceCount > 0
+        ? 'adjacent_evidence'
+        : 'evidence_gap';
+    const notes = [
+      hasDirectExemplar
+        ? `Use ${directExemplarFile} as the direct ${role.primary} exemplar.`
+        : `No role-compatible ${role.primary} exemplar found; do not copy an unrelated service/client as the primary shape.`,
+      constructionPatterns.length > 0
+        ? 'Use construction evidence only for wiring style, not as an implementation template.'
+        : 'No indexed construction evidence found for services.',
+      configPatterns.length > 0
+        ? 'Config evidence is adjacent; verify whether this planned service should read config.'
+        : 'No relevant config evidence found.',
+    ];
+
+    return {
+      file,
+      kind: 'service',
+      role,
+      status,
+      confidence: hasDirectExemplar
+        ? exemplar?.confidence ?? 0.85
+        : adjacentEvidenceCount > 0
+          ? 0.55
+          : 0.2,
+      directExemplarFile,
+      constructionPatterns,
+      configPatterns,
+      usageExamples,
+      notes,
+    };
+  }
+
+  private serviceConstructionEvidence(): BootstrapPatternEvidence[] {
+    const evidence: BootstrapPatternEvidence[] = [];
+    const sourceFiles = this.indexedProjectFiles()
+      .filter(file => /\.(php|ts|js)$/i.test(file))
+      .filter(file => /^(app|src|routes|config)\//.test(file))
+      .filter(file => !this.isGeneratedPath(file));
+
+    const constructorInjectionFiles = this.filesMatchingSourcePattern(
+      sourceFiles,
+      /\b__construct\s*\([^)]*(?:private|protected|public)?\s*[\\A-Za-z_][\\A-Za-z0-9_]*\s+\$\w+/,
+      5,
+    );
+    if (constructorInjectionFiles.length > 0) {
+      evidence.push({
+        pattern: 'constructor_injection',
+        confidence: 0.72,
+        files: constructorInjectionFiles,
+        reason: 'Classes receive typed dependencies through constructors.',
+      });
+    }
+
+    const serviceProviderFiles = this.filesMatchingSourcePattern(
+      sourceFiles,
+      /(?:\$this->app|app\(\))->(?:singleton|bind|scoped|instance)\s*\(/,
+      5,
+    );
+    if (serviceProviderFiles.length > 0) {
+      evidence.push({
+        pattern: 'container_binding',
+        confidence: 0.78,
+        files: serviceProviderFiles,
+        reason: 'Application services are registered through container binding calls.',
+      });
+    }
+
+    const directInstantiationFiles = this.filesMatchingSourcePattern(
+      sourceFiles,
+      /\bnew\s+[A-Z][A-Za-z0-9_]*(?:Service|Client|Registry|Repository|Resolver|Manager|Builder|Gateway|Adapter)\b/,
+      5,
+    );
+    if (directInstantiationFiles.length > 0) {
+      evidence.push({
+        pattern: 'direct_instantiation',
+        confidence: 0.5,
+        files: directInstantiationFiles,
+        reason: 'Some service-like collaborators are directly instantiated.',
+      });
+    }
+
+    return evidence;
+  }
+
+  private serviceConfigEvidence(role: { family: string; primary: string }): BootstrapPatternEvidence[] {
+    const evidence: BootstrapPatternEvidence[] = [];
+    const sourceFiles = this.indexedProjectFiles()
+      .filter(file => /\.(php|ts|js)$/i.test(file))
+      .filter(file => /^(app|src|config)\//.test(file))
+      .filter(file => !this.isGeneratedPath(file));
+    const configCallFiles = this.filesMatchingSourcePattern(sourceFiles, /\bconfig\s*\(\s*['"][^'"]+['"]/, 5);
+    if (configCallFiles.length > 0) {
+      evidence.push({
+        pattern: 'config_lookup',
+        confidence: 0.64,
+        files: configCallFiles,
+        reason: 'Code reads framework/application config values.',
+      });
+    }
+
+    const configFiles = this.indexedProjectFiles()
+      .filter(file => file.startsWith('config/') && file.endsWith('.php'))
+      .filter(file => !this.isGeneratedPath(file));
+    const roleConfigFiles = configFiles
+      .filter(file => {
+        const lower = file.toLowerCase();
+        return lower.includes(role.primary) || lower.includes(role.family.replace(/s$/, ''));
+      })
+      .slice(0, 5);
+    if (roleConfigFiles.length > 0) {
+      evidence.push({
+        pattern: 'role_config_file',
+        confidence: 0.58,
+        files: roleConfigFiles,
+        reason: `Config files mention the ${role.primary} role or ${role.family} family.`,
+      });
+    } else if (configFiles.length > 0) {
+      evidence.push({
+        pattern: 'config_array_files',
+        confidence: 0.42,
+        files: configFiles.slice(0, 5),
+        reason: 'Config array files exist, but none are role-specific for this planned service.',
+      });
+    }
+
+    return evidence;
+  }
+
+  private serviceUsageEvidence(
+    role: { family: string; primary: string },
+    directExemplarFile: string | null,
+  ): BootstrapPatternEvidence[] {
+    const evidence: BootstrapPatternEvidence[] = [];
+    if (directExemplarFile) {
+      const directConsumers = this.consumerFilesForServiceFile(directExemplarFile).slice(0, 5);
+      if (directConsumers.length > 0) {
+        evidence.push({
+          pattern: 'direct_exemplar_consumers',
+          confidence: 0.82,
+          files: directConsumers,
+          reason: `Files that consume the direct ${role.primary} exemplar.`,
+        });
+      }
+    }
+
+    const compatibleServiceFiles = this.store.getAllNodes()
+      .filter(node => ['service', 'class'].includes(node.kind))
+      .filter(node => this.serviceRolesAreCompatible(role, this.serviceRoleForNode(node)))
+      .map(node => node.filePath)
+      .filter((file, index, files) => files.indexOf(file) === index)
+      .filter(file => file !== directExemplarFile)
+      .slice(0, 5);
+    if (compatibleServiceFiles.length > 0) {
+      evidence.push({
+        pattern: 'same_role_service_files',
+        confidence: 0.7,
+        files: compatibleServiceFiles,
+        reason: `Existing service-like files share the ${role.primary} role.`,
+      });
+    }
+
+    const serviceConsumerFiles = this.filesMatchingSourcePattern(
+      this.indexedProjectFiles()
+        .filter(file => /\.(php|ts|js)$/i.test(file))
+        .filter(file => /^(app|src)\//.test(file))
+        .filter(file => !this.isGeneratedPath(file)),
+      /\b(?:Service|Client|Registry|Repository|Resolver|Manager|Builder|Gateway|Adapter)\b/,
+      5,
+    );
+    if (serviceConsumerFiles.length > 0) {
+      evidence.push({
+        pattern: 'service_collaborator_usage',
+        confidence: 0.52,
+        files: serviceConsumerFiles,
+        reason: 'Application code references service-like collaborators.',
+      });
+    }
+
+    if (['registry', 'resolver', 'repository', 'manager'].includes(role.primary)) {
+      const gatekeeperFiles = this.filesMatchingSourcePattern(
+        this.indexedProjectFiles()
+          .filter(file => /\.(php|ts|js)$/i.test(file))
+          .filter(file => /^(app|src|config)\//.test(file))
+          .filter(file => !this.isGeneratedPath(file)),
+        /\b(?:validate[A-Z]\w*|resolve[A-Z]\w*|find[A-Z]\w*|lookup[A-Z]\w*|get[A-Z]\w*|all[A-Z]\w*)\s*\(/,
+        5,
+      );
+      if (gatekeeperFiles.length > 0) {
+        evidence.push({
+          pattern: 'gatekeeper_or_lookup_methods',
+          confidence: 0.48,
+          files: gatekeeperFiles,
+          reason: `Nearby code exposes lookup/validation methods that may inform a ${role.primary} service API.`,
+        });
+      }
+    }
+
+    return evidence;
+  }
+
+  private consumerFilesForServiceFile(file: string): string[] {
+    const nodes = this.store.getNodesByFile(file);
+    const consumers = new Set<string>();
+    for (const node of nodes) {
+      for (const edge of this.store.getEdgesTo(node.id)) {
+        const source = this.store.getNodeById(edge.sourceId);
+        if (source && source.filePath !== file && !this.isGeneratedPath(source.filePath)) {
+          consumers.add(source.filePath);
+        }
+      }
+    }
+    return Array.from(consumers).sort();
+  }
+
+  private filesMatchingSourcePattern(
+    files: string[],
+    pattern: RegExp,
+    limit: number,
+  ): string[] {
+    const matches: string[] = [];
+    for (const file of files) {
+      const source = this.readProjectTextFile(file);
+      if (!source || !pattern.test(source)) {
+        continue;
+      }
+      matches.push(file);
+      if (matches.length >= limit) {
+        break;
+      }
+    }
+    return matches;
+  }
+
+  private exemplarOptionsForPlannedFile(file: string, kind: string): ExemplarOptions {
+    if (kind !== 'action') {
+      if (kind === 'component') {
+        const name = basename(file).toLowerCase();
+        if (/modal|dialog/.test(name)) {
+          return { subKind: 'modal' };
+        }
+        if (/layout|shell/.test(name)) {
+          return { subKind: 'layout' };
+        }
+        if (/form/.test(name)) {
+          return { subKind: 'form' };
+        }
+        if (/table|list/.test(name)) {
+          return { subKind: 'list' };
+        }
+        return { subKind: 'leaf' };
+      }
+      return {};
+    }
+
+    const name = basename(file, '.php').toLowerCase();
+    if (/^(show|get|view)/.test(name)) {
+      return { subKind: 'show', routeMethod: 'GET' };
+    }
+    if (/^(list|index)/.test(name)) {
+      return { subKind: 'index', routeMethod: 'GET' };
+    }
+    if (/^(create|store|discover|add)/.test(name)) {
+      return { subKind: 'create', routeMethod: 'POST' };
+    }
+    if (/^(update|patch)/.test(name)) {
+      return { subKind: 'update', routeMethod: 'PATCH' };
+    }
+    if (/^(delete|destroy|remove)/.test(name)) {
+      return { subKind: 'delete', routeMethod: 'DELETE' };
+    }
+    return {};
+  }
+
+  private exemplarForPlannedFile(
+    file: string,
+    kind: string,
+    specExistingFiles: string[] = [],
+  ): PlannedFileExemplarCandidate | null {
+    const specMentioned = this.getSpecMentionedExemplarForPlannedFile(file, kind, specExistingFiles);
+    if (specMentioned && specMentioned.confidence >= 0.75) {
+      return specMentioned;
+    }
+
+    let fallback: PlannedFileExemplarCandidate | null = null;
+    if (kind === 'inertia_page') {
+      const pageExemplar = this.getInertiaPageExemplarForPlannedFile(file);
+      if (pageExemplar) {
+        fallback = this.toPlannedFileExemplarCandidate(file, kind, pageExemplar, 0);
+      }
+    } else if (kind === 'service') {
+      const serviceExemplar = this.getServiceLikeExemplarForPlannedFile(file);
+      if (serviceExemplar) {
+        fallback = this.toPlannedFileExemplarCandidate(file, kind, serviceExemplar, 0);
+      } else {
+        return specMentioned;
+      }
+    } else if (kind === 'config_array') {
+      const configExemplar = this.getConfigArrayExemplarForPlannedFile(file);
+      if (configExemplar) {
+        fallback = this.toPlannedFileExemplarCandidate(file, kind, configExemplar, 0);
+      } else {
+        return specMentioned;
+      }
+    } else {
+      const exemplar = this.exemplar(kind, undefined, this.exemplarOptionsForPlannedFile(file, kind));
+      fallback = exemplar
+        ? this.toPlannedFileExemplarCandidate(file, kind, exemplar, 0)
+        : null;
+    }
+
+    if (!fallback) {
+      return specMentioned;
+    }
+
+    if (!specMentioned || fallback.confidence >= specMentioned.confidence) {
+      return fallback;
+    }
+
+    return specMentioned;
+  }
+
+  private toPlannedFileExemplarCandidate(
+    plannedFile: string,
+    kind: string,
+    exemplar: { nodeId: number; file: string; reason: string },
+    coMentionConfidence: number,
+  ): PlannedFileExemplarCandidate {
+    const node = this.store.getNodeById(exemplar.nodeId)
+      ?? this.store.getNodesByFile(exemplar.file)
+        .find(candidate => this.normalizeKindAlias(candidate.kind) === this.normalizeKindAlias(kind));
+    const shapeMatchConfidence = node
+      ? this.shapeMatchConfidenceForPlannedFile(plannedFile, kind, node)
+      : Math.min(0.75, this.kindConventionConfidence(kind));
+    const confidence = Math.min(this.kindConventionConfidence(kind), Math.max(0.2, shapeMatchConfidence));
+    return {
+      ...exemplar,
+      confidence,
+      coMentionConfidence,
+      shapeMatchConfidence,
+      confidenceReason: coMentionConfidence > 0
+        ? 'Confidence is bounded by structural shape match; spec co-mention alone is not treated as imitation evidence.'
+        : 'Confidence is based on structural shape and mined kind conventions.',
+    };
+  }
+
+  private shapeMatchConfidenceForPlannedFile(
+    plannedFile: string,
+    kind: string,
+    candidate: WeaveNode,
+  ): number {
+    const normalizedKind = this.normalizeKindAlias(kind);
+    const candidateKind = this.normalizeKindAlias(candidate.kind);
+    const options = this.exemplarOptionsForPlannedFile(plannedFile, normalizedKind);
+    const pathScore = Math.min(
+      0.22,
+      this.sharedPathSegmentCount(
+        this.pathSegmentsForSimilarity(plannedFile),
+        this.pathSegmentsForSimilarity(candidate.filePath),
+      ) * 0.055,
+    );
+    const sameKindScore = candidateKind === normalizedKind ? 0.25 : 0.08;
+
+    if (normalizedKind === 'composable') {
+      const composableScore = this.composableShapeScore(candidate, plannedFile);
+      const composablePathScore = Math.min(0.1, pathScore);
+      const confidence = 0.08
+        + (candidateKind === normalizedKind ? 0.14 : 0.04)
+        + composablePathScore
+        + Math.min(0.62, composableScore / 150);
+      return Math.max(0.05, Math.min(1, Number(confidence.toFixed(2))));
+    }
+
+    let shapeScore = 0.15 + pathScore + sameKindScore;
+
+    if (normalizedKind === 'component' && options.subKind) {
+      shapeScore += Math.min(0.48, this.componentShapeScore(candidate, options.subKind.toLowerCase()) / 100);
+    } else if (normalizedKind === 'action') {
+      shapeScore += Math.min(0.52, this.actionShapeScore(candidate, options) / 110);
+    } else if (normalizedKind === 'inertia_page') {
+      if (candidate.filePath.startsWith('resources/js/Pages/')) shapeScore += 0.28;
+      if (candidate.filePath.includes('/Admin/') === plannedFile.includes('/Admin/')) shapeScore += 0.12;
+    } else if (normalizedKind === 'service') {
+      const plannedRole = this.serviceRoleForFile(plannedFile);
+      const candidateRole = this.serviceRoleForNode(candidate);
+      if (plannedRole.primary === candidateRole.primary) shapeScore += 0.32;
+      if (plannedRole.family === candidateRole.family) shapeScore += 0.12;
+    } else if (normalizedKind === 'config_array') {
+      if (this.configSectionForFile(plannedFile) === this.configSectionForFile(candidate.filePath)) {
+        shapeScore += 0.36;
+      }
+    }
+
+    return Math.max(0.05, Math.min(1, Number(shapeScore.toFixed(2))));
+  }
+
+  private composableShapeScore(node: WeaveNode, plannedFile: string): number {
+    const source = this.readProjectTextFile(node.filePath) ?? '';
+    const plannedIdentifier = basename(plannedFile, extname(plannedFile));
+    let score = 0;
+    if (node.filePath.startsWith('resources/js/composables/')) score += 18;
+    if (/^use[A-Z]/.test(node.symbolName) || /^use[A-Z]/.test(basename(node.filePath, extname(node.filePath)))) score += 18;
+    if (source.includes('return {')) score += 14;
+    if (/\bonUnmounted\s*\(/.test(source)) score += 14;
+    if (/\b(ref|computed|watch)\s*\(/.test(source)) score += 8;
+    const plannedMutation = /unlock|discover|save|update|create|post/i.test(plannedIdentifier);
+    const hasMutationSurface = /\b(fetch|router\.(?:post|put|patch|delete)|axios|postWithKeepalive)\s*\(/.test(source);
+    if (hasMutationSurface) score += plannedMutation ? 24 : 6;
+    else if (plannedMutation) score -= 45;
+    const plannedTimer = /typing|timer|debounce|interval/i.test(plannedIdentifier);
+    const hasTimerSurface = /\btimers?\b|setTimeout|setInterval|clearTimeout|clearInterval/.test(source);
+    if (hasTimerSurface) score += plannedTimer ? 24 : 4;
+    else if (plannedTimer) score -= 30;
+    const plannedMatcher = /matcher|regex|regexp|pattern|parser|tokenizer/i.test(plannedIdentifier);
+    const hasMatcherSurface = /\b(?:RegExp|matchAll|match|replace|split|includes|startsWith|endsWith)\s*\(/.test(source);
+    if (hasMatcherSurface) score += plannedMatcher ? 24 : 4;
+    else if (plannedMatcher) score -= 45;
+    return score;
+  }
+
+  private getConfigArrayExemplarForPlannedFile(file: string): {
+    nodeId: number;
+    file: string;
+    reason: string;
+  } | null {
+    const plannedSection = this.configSectionForFile(file);
+    const candidates = this.store.getNodesByKind('config_array')
+      .filter(node => !this.isGeneratedPath(node.filePath))
+      .map(node => {
+        const section = this.configSectionForFile(node.filePath);
+        if (section !== plannedSection) {
+          return null;
+        }
+        const score = 40
+          + this.sharedPathSegmentCount(
+            this.pathSegmentsForSimilarity(file),
+            this.pathSegmentsForSimilarity(node.filePath),
+          ) * 12;
+        return { node, score };
+      })
+      .filter((candidate): candidate is { node: WeaveNode; score: number } => Boolean(candidate))
+      .sort((a, b) => b.score - a.score || a.node.filePath.localeCompare(b.node.filePath));
+
+    const best = candidates[0];
+    if (!best) {
+      return null;
+    }
+
+    return {
+      nodeId: best.node.id,
+      file: best.node.filePath,
+      reason: `Closest config-array exemplar under ${plannedSection}`,
+    };
+  }
+
+  private configSectionForFile(filePath: string): string {
+    const normalized = filePath.replace(/\\/g, '/');
+    const match = normalized.match(/^config\/([^/]+)/);
+    return match?.[1] ?? 'root';
+  }
+
+  private getServiceLikeExemplarForPlannedFile(file: string): {
+    nodeId: number;
+    file: string;
+    reason: string;
+  } | null {
+    const plannedSegments = this.pathSegmentsForSimilarity(file);
+    const plannedRole = this.serviceRoleForFile(file);
+    const serviceLikeName = /(service|client|integration|gateway|adapter|manager|registry|repository|resolver|builder)/i;
+    const candidates = this.store.getAllNodes()
+      .filter(node => !this.isGeneratedPath(node.filePath))
+      .filter(node => ['service', 'class'].includes(node.kind))
+      .filter(node =>
+        /^(?:app|src)\/(?:Services|Clients|Integrations|Support|Lib|Domain)\//.test(node.filePath)
+        || serviceLikeName.test(`${node.symbolName} ${node.filePath}`),
+      )
+      .filter(node => this.serviceRolesAreCompatible(plannedRole, this.serviceRoleForNode(node)))
+      .map(node => {
+        let score = node.kind === 'service' ? 40 : 24;
+        const candidateRole = this.serviceRoleForNode(node);
+        if (candidateRole.primary === plannedRole.primary) score += 28;
+        if (candidateRole.family === plannedRole.family) score += 16;
+        if (serviceLikeName.test(node.symbolName)) score += 12;
+        if (/^(?:app|src)\/(?:Services|Clients|Integrations)\//.test(node.filePath)) score += 16;
+        score += this.sharedPathSegmentCount(plannedSegments, this.pathSegmentsForSimilarity(node.filePath)) * 8;
+        return { node, score };
+      })
+      .filter(candidate => candidate.score >= 70)
+      .sort((a, b) => b.score - a.score || a.node.filePath.localeCompare(b.node.filePath));
+
+    const best = candidates[0];
+    if (!best) {
+      return null;
+    }
+
+    return {
+      nodeId: best.node.id,
+      file: best.node.filePath,
+      reason: `Closest ${plannedRole.primary} service exemplar by role and path similarity`,
+    };
+  }
+
+  private serviceRoleForNode(node: WeaveNode): { family: string; primary: string } {
+    return this.serviceRoleForFile(node.filePath, node.symbolName);
+  }
+
+  private serviceRoleForFile(filePath: string, symbolName = basename(filePath, extname(filePath))): {
+    family: string;
+    primary: string;
+  } {
+    const normalizedPath = filePath.replace(/\\/g, '/');
+    const symbol = symbolName.toLowerCase();
+    const identifier = `${symbolName} ${normalizedPath}`.toLowerCase();
+    const family = normalizedPath.match(/^(?:app|src)\/([^/]+)\//)?.[1]?.toLowerCase() ?? 'unknown';
+    const rolePatterns: Array<[string, RegExp]> = [
+      ['registry', /\bregistry\b|registry$/],
+      ['repository', /\brepository\b|repository$/],
+      ['resolver', /\bresolver\b|resolver$/],
+      ['builder', /\bbuilder\b|builder$/],
+      ['manager', /\bmanager\b|manager$/],
+      ['gateway', /\bgateway\b|gateway$/],
+      ['adapter', /\badapter\b|adapter$/],
+      ['client', /\bclient\b|client$/],
+      ['integration', /\bintegration\b|integration$/],
+      ['service', /\bservice\b|service$/],
+    ];
+
+    for (const [role, pattern] of rolePatterns) {
+      if (symbol.endsWith(role) || pattern.test(identifier)) {
+        return { family, primary: role };
+      }
+    }
+
+    if (['services', 'clients', 'integrations'].includes(family)) {
+      return { family, primary: family.slice(0, -1) };
+    }
+
+    return { family, primary: 'plain_class' };
+  }
+
+  private serviceRolesAreCompatible(
+    planned: { family: string; primary: string },
+    candidate: { family: string; primary: string },
+  ): boolean {
+    if (planned.primary === candidate.primary) {
+      return true;
+    }
+
+    if (planned.primary === 'service' && candidate.family === 'services') {
+      return true;
+    }
+
+    if (
+      planned.family === 'clients'
+      && ['client', 'gateway', 'integration', 'adapter'].includes(candidate.primary)
+    ) {
+      return true;
+    }
+
+    if (
+      planned.family === 'integrations'
+      && ['integration', 'client', 'gateway', 'adapter'].includes(candidate.primary)
+    ) {
+      return true;
+    }
+
+    return false;
+  }
+
+  private getSpecMentionedExemplarForPlannedFile(
+    file: string,
+    kind: string,
+    specExistingFiles: string[],
+  ): PlannedFileExemplarCandidate | null {
+    if (specExistingFiles.length === 0) {
+      return null;
+    }
+
+    const plannedKind = this.normalizeKindAlias(kind);
+    if (!['component', 'inertia_page', 'action', 'composable'].includes(plannedKind)) {
+      return null;
+    }
+
+    const plannedSegments = this.pathSegmentsForSimilarity(file);
+    const scored = specExistingFiles
+      .flatMap(existingFile => this.store.getNodesByFile(existingFile))
+      .filter(node => !this.isGeneratedPath(node.filePath))
+      .map(node => {
+        const candidateKind = this.normalizeKindAlias(node.kind);
+        if (
+          candidateKind !== plannedKind
+          && !(plannedKind === 'component' && candidateKind === 'inertia_page')
+        ) {
+          return null;
+        }
+
+        const shapeMatchConfidence = this.shapeMatchConfidenceForPlannedFile(file, plannedKind, node);
+        let score = shapeMatchConfidence * 100;
+        score += this.sharedPathSegmentCount(plannedSegments, this.pathSegmentsForSimilarity(node.filePath)) * 6;
+        if (candidateKind === plannedKind) score += 10;
+
+        return { node, score, shapeMatchConfidence };
+      })
+      .filter((candidate): candidate is { node: WeaveNode; score: number; shapeMatchConfidence: number } =>
+        candidate !== null && candidate.shapeMatchConfidence >= 0.2,
+      )
+      .sort((a, b) => b.score - a.score || a.node.filePath.localeCompare(b.node.filePath));
+
+    const best = scored[0];
+    if (!best) {
+      return null;
+    }
+
+    const base = this.toPlannedFileExemplarCandidate(file, plannedKind, {
+      nodeId: best.node.id,
+      file: best.node.filePath,
+      reason: 'Best exemplar among files explicitly co-mentioned by the spec',
+    }, 1);
+    return {
+      ...base,
+      reason: `${base.reason}; structural shape confidence is separate from spec co-mention`,
+      confidenceReason: 'Spec co-mention explains relevance, but headline confidence is bounded by structural shape match.',
+    };
+  }
+
+  private getInertiaPageExemplarForPlannedFile(file: string): {
+    nodeId: number;
+    file: string;
+    reason: string;
+  } | null {
+    const plannedSegments = this.pathSegmentsForSimilarity(file);
+    const plannedName = basename(file).toLowerCase();
+    const plannedIsAdmin = file.includes('/Admin/');
+
+    const candidates = this.store.getNodesByKind('inertia_page')
+      .filter(node => !this.isGeneratedPath(node.filePath))
+      .map(node => {
+        const candidateIsAdmin = node.filePath.includes('/Admin/');
+        let score = this.kindConventionConfidence('inertia_page') * 10;
+        if (candidateIsAdmin === plannedIsAdmin) score += 24;
+        if (candidateIsAdmin && !plannedIsAdmin) score -= 36;
+        if (basename(node.filePath).toLowerCase() === plannedName) score += 20;
+        score += this.sharedPathSegmentCount(plannedSegments, this.pathSegmentsForSimilarity(node.filePath)) * 6;
+        return { node, score };
+      })
+      .filter(candidate => candidate.score > 0)
+      .sort((a, b) => b.score - a.score || a.node.filePath.localeCompare(b.node.filePath));
+
+    const best = candidates[0];
+    if (!best) {
+      return null;
+    }
+
+    return {
+      nodeId: best.node.id,
+      file: best.node.filePath,
+      reason: 'Best inertia page exemplar by route/page path similarity',
+    };
+  }
+
+  private pathSegmentsForSimilarity(filePath: string): string[] {
+    return filePath
+      .replace(/\.[^.]+$/, '')
+      .split(/[\\/_.-]+/)
+      .flatMap(segment => segment.replace(/([a-z0-9])([A-Z])/g, '$1 $2').split(/\s+/))
+      .map(segment => this.normalizeTaskTerm(segment.toLowerCase()))
+      .filter(segment => segment.length >= 3)
+      .filter(segment => !['resources', 'app', 'js', 'pages', 'components', 'actions'].includes(segment));
+  }
+
+  private sharedPathSegmentCount(a: string[], b: string[]): number {
+    const bSet = new Set(b);
+    return Array.from(new Set(a)).filter(segment => bSet.has(segment)).length;
+  }
+
+  private contextualBareSpecReferences(
+    suspiciousReferences: string[],
+    projectReferences: string[],
+  ): Set<string> {
+    const contextualBasenames = new Set(
+      projectReferences
+        .filter(reference => reference.includes('/'))
+        .map(reference => basename(reference)),
+    );
+    const hasConfigTreeReferences = projectReferences.some(reference =>
+      /^config\/.+\.php$/.test(reference),
+    );
+
+    return new Set(
+      suspiciousReferences.filter(reference =>
+        !reference.includes('/')
+        && (
+          contextualBasenames.has(basename(reference))
+          || (hasConfigTreeReferences && reference !== 'index.php' && /^[a-z0-9_-]+\.php$/.test(reference))
+        ),
+      ),
+    );
+  }
+
+  private resolveSpecInput(specInput: string): { file: string; content: string } {
+    const file = this.toRelativePath(specInput);
+    const content = this.readProjectTextFile(file);
+    if (content !== null) {
+      return { file, content };
+    }
+
+    if (this.looksLikeInlineMarkdownSpec(specInput)) {
+      return { file: '<inline-spec>', content: specInput };
+    }
+
+    throw new Error(`Spec file not found: ${file}`);
+  }
+
+  private inferSpecInputFromBootstrapQuery(query: BootstrapQuery): string | null {
+    if (query.start && this.isMarkdownSpecPath(query.start) && this.readProjectTextFile(this.toRelativePath(query.start)) !== null) {
+      return query.start;
+    }
+
+    return this.firstMentionedMarkdownSpecPath(query.task);
+  }
+
+  private firstMentionedMarkdownSpecPath(text: string): string | null {
+    for (const match of text.matchAll(/(?:`|^|[\s=:(])([A-Za-z0-9_./@-]+\.md)(?:`|[\s),.;:]|$)/g)) {
+      const raw = match[1];
+      if (!raw) {
+        continue;
+      }
+      const normalized = this.toRelativePath(raw);
+      if (this.isMarkdownSpecPath(normalized) && this.readProjectTextFile(normalized) !== null) {
+        return normalized;
+      }
+    }
+
+    return null;
+  }
+
+  private isMarkdownSpecPath(filePath: string): boolean {
+    return /\.md$/i.test(filePath);
+  }
+
+  private looksLikeInlineMarkdownSpec(value: string): boolean {
+    return value.includes('\n')
+      || value.trimStart().startsWith('#')
+      || value.includes('| ---')
+      || value.includes('```')
+      || /`[^`]+\.(?:php|vue|js|ts|tsx|jsx|py|md|css|scss|json|yaml|yml|sql)(?::\d+(?:-\d+)?)?`/.test(value);
+  }
+
+  private extractSpecReferences(
+    content: string,
+    specFile: string,
+  ): { files: string[]; lineReferences: BootstrapSpecLineReference[] } {
+    const references = new Set<string>();
+    const lineReferences: BootstrapSpecLineReference[] = [];
+    const lineReferenceKeys = new Set<string>();
+    const pathPattern = /(^|[`\s|])([A-Za-z0-9_./@-]+\.(?:php|vue|js|ts|tsx|jsx|py|md|css|scss|json|yaml|yml|sql))(?::(\d+)(?:-(\d+))?)?(?=$|[`\s|])/gm;
+
+    for (const treeReference of this.extractMarkdownTreeReferences(content, specFile)) {
+      references.add(treeReference);
+    }
+
+    for (const match of content.matchAll(pathPattern)) {
+      const rawReference = match[2]?.trim();
+      if (!rawReference || rawReference.startsWith('http')) {
+        continue;
+      }
+
+      const normalized = this.normalizeSpecFileReference(rawReference, specFile);
+      if (normalized) {
+        references.add(normalized);
+        const lineStart = match[3] ? Number(match[3]) : null;
+        if (lineStart !== null) {
+          const lineEnd = match[4] ? Number(match[4]) : undefined;
+          const key = `${normalized}:${lineStart}:${lineEnd ?? ''}`;
+          if (!lineReferenceKeys.has(key)) {
+            lineReferenceKeys.add(key);
+            lineReferences.push({
+              file: normalized,
+              lineStart,
+              ...(lineEnd ? { lineEnd } : {}),
+            });
+          }
+        }
+      }
+    }
+
+    return { files: Array.from(references), lineReferences };
+  }
+
+  private extractMarkdownTreeReferences(content: string, specFile: string): string[] {
+    const references = new Set<string>();
+    const stack: string[][] = [];
+    let inFence = false;
+
+    for (const line of content.split('\n')) {
+      const trimmed = line.trim();
+      if (trimmed.startsWith('```') || trimmed.startsWith('~~~')) {
+        inFence = !inFence;
+        continue;
+      }
+
+      const treeItem = this.parseMarkdownTreeItem(line, inFence);
+      if (!treeItem) {
+        if (!inFence && trimmed.length === 0) {
+          stack.length = 0;
+        }
+        continue;
+      }
+
+      const segments = treeItem.item
+        .replace(/\/$/, '')
+        .split('/')
+        .filter(Boolean);
+      if (segments.length === 0) {
+        continue;
+      }
+
+      const parent = treeItem.hasBranch
+        ? stack[treeItem.depth - 1] ?? []
+        : [];
+      const fullSegments = treeItem.item.includes('/') && !treeItem.hasBranch
+        ? segments
+        : [...parent, ...segments];
+      const fullPath = fullSegments.join('/');
+
+      if (treeItem.item.endsWith('/')) {
+        stack[treeItem.depth] = fullSegments;
+        stack.length = treeItem.depth + 1;
+        continue;
+      }
+
+      if (!this.isSupportedSpecPath(fullPath)) {
+        continue;
+      }
+
+      const normalized = this.normalizeSpecFileReference(fullPath, specFile);
+      if (normalized) {
+        references.add(normalized);
+      }
+    }
+
+    return Array.from(references);
+  }
+
+  private dedupeDefaultInferredSpecReferences(files: string[]): string[] {
+    const byBasename = new Map<string, string[]>();
+    for (const file of files) {
+      const entries = byBasename.get(basename(file)) ?? [];
+      entries.push(file);
+      byBasename.set(basename(file), entries);
+    }
+
+    return files.filter(file => {
+      const alternatives = byBasename.get(basename(file)) ?? [];
+      if (alternatives.length <= 1) {
+        return true;
+      }
+      if (!this.isDefaultInferredBareSpecPath(file)) {
+        return true;
+      }
+      return !alternatives.some(alternative =>
+        alternative !== file && alternative.split('/').length > file.split('/').length,
+      );
+    });
+  }
+
+  private isDefaultInferredBareSpecPath(file: string): boolean {
+    return /^resources\/js\/Components\/[^/]+\.(?:vue|js|ts)$/.test(file)
+      || /^resources\/js\/composables\/[^/]+\.(?:js|ts)$/.test(file)
+      || /^app\/Actions\/[^/]+Action\.php$/.test(file)
+      || /^app\/Models\/[^/]+\.php$/.test(file);
+  }
+
+  private parseMarkdownTreeItem(line: string, inFence = false): {
+    item: string;
+    depth: number;
+    hasBranch: boolean;
+  } | null {
+    const match = line.match(/([A-Za-z0-9_./@-]+(?:\.(?:php|vue|js|ts|tsx|jsx|py|md|css|scss|json|yaml|yml|sql)|\/))\s*$/);
+    if (!match || !match[1]) {
+      return null;
+    }
+
+    const item = match[1];
+    const prefix = line.slice(0, line.lastIndexOf(item));
+    const hasBullet = inFence && /(?:^|\s)[-*+]\s*$/.test(prefix);
+    const hasBranch = hasBullet
+      || /[├└+]/.test(prefix)
+      || /(?:^|\s)[|`\\-]*[-─]{2,}\s*$/.test(prefix);
+    if (!hasBranch && !item.endsWith('/')) {
+      return null;
+    }
+
+    const indentDepth = (prefix.match(/(?:│|\|)? {2,4}/g) ?? []).length;
+    const branchDepth = hasBranch ? 1 : 0;
+
+    return {
+      item,
+      depth: indentDepth + branchDepth,
+      hasBranch,
+    };
+  }
+
+  private isSupportedSpecPath(path: string): boolean {
+    return /\.(?:php|vue|js|ts|tsx|jsx|py|md|css|scss|json|yaml|yml|sql)$/i.test(path);
+  }
+
+  private normalizeSpecFileReference(reference: string, specFile: string): string | null {
+    const referenceWithoutLineRange = reference.replace(/:\d+(?:-\d+)?$/, '');
+    if (this.looksLikeLibraryToken(referenceWithoutLineRange)) {
+      return null;
+    }
+
+    const normalized = referenceWithoutLineRange
+      .replace(/^\.\/+/, '')
+      .replace(/^@\//, 'resources/js/');
+
+    if (existsSync(join(this.projectRoot, normalized))) {
+      return normalized;
+    }
+
+    const relativeToSpec = join(dirname(specFile), normalized).replace(/\\/g, '/');
+    if (existsSync(join(this.projectRoot, relativeToSpec))) {
+      return relativeToSpec;
+    }
+
+    const basenameMatch = this.resolveBareSpecFileReference(normalized);
+    if (basenameMatch) {
+      return basenameMatch;
+    }
+
+    return this.inferProjectPathForSpecReference(normalized);
+  }
+
+  private resolveBareSpecFileReference(reference: string): string | null {
+    if (reference.includes('/')) {
+      return null;
+    }
+    if (this.isAmbiguousBareSpecFilename(reference)) {
+      return null;
+    }
+
+    const matches = this.indexedProjectFiles()
+      .filter(file => basename(file) === reference)
+      .sort((a, b) => a.length - b.length || a.localeCompare(b));
+
+    return matches[0] ?? null;
+  }
+
+  private isAmbiguousBareSpecFilename(reference: string): boolean {
+    return /^index\.(?:php|vue|js|ts|tsx|jsx|css|scss|md|json)$/i.test(reference);
+  }
+
+  private inferProjectPathForSpecReference(reference: string): string {
+    if (reference.startsWith('Pages/')) {
+      return `resources/js/${reference}`;
+    }
+    if (reference.startsWith('Components/')) {
+      return `resources/js/${reference}`;
+    }
+    if (reference.startsWith('composables/')) {
+      return `resources/js/${reference}`;
+    }
+    if (reference.includes('/')) {
+      return reference;
+    }
+    if (reference.endsWith('.vue')) {
+      return `resources/js/Components/${reference}`;
+    }
+    if (reference.match(/^use[A-Z].*\.(?:js|ts)$/)) {
+      return `resources/js/composables/${reference}`;
+    }
+    if (reference.endsWith('.php') && reference.match(/^[A-Z].*Action\.php$/)) {
+      return `app/Actions/${reference}`;
+    }
+    if (reference.endsWith('.php') && reference.match(/^[A-Z].*\.php$/)) {
+      return `app/Models/${reference}`;
+    }
+    return reference;
+  }
+
+  private looksLikeLibraryToken(reference: string): boolean {
+    if (reference.includes('/')) {
+      return false;
+    }
+
+    const packageLikeExtensions = ['.js', '.ts', '.css'];
+    return packageLikeExtensions.some(extension => reference.endsWith(extension))
+      && !existsSync(join(this.projectRoot, reference))
+      && !reference.match(/^use[A-Z]/);
+  }
+
+  private looksLikeProjectFilePath(reference: string): boolean {
+    return reference.includes('/')
+      || reference.startsWith('app.')
+      || reference.startsWith('use')
+      || /^[A-Z]/.test(reference)
+      || reference.startsWith('config.')
+      || reference.startsWith('database.');
+  }
+
+  private findNovelPathPrefixes(files: string[]): string[] {
+    const prefixes = new Set<string>();
+    for (const file of files) {
+      const prefix = this.firstMissingPathPrefix(file);
+      if (prefix) {
+        prefixes.add(prefix);
+      }
+    }
+    return Array.from(prefixes).sort();
+  }
+
+  private firstMissingPathPrefix(file: string): string | null {
+    const parts = file.split('/').filter(Boolean);
+    for (let i = 1; i < parts.length; i++) {
+      const prefix = parts.slice(0, i).join('/');
+      if (!existsSync(join(this.projectRoot, prefix))) {
+        return prefix;
+      }
+    }
+    return null;
+  }
+
+  private inferSpecEntryCandidates(
+    specContext: BootstrapSpecContext,
+    maxCandidates: number,
+  ): BootstrapEntryCandidate[] {
+    const candidates: BootstrapEntryCandidate[] = [];
+    const lineReferenceCounts = new Map<string, number>();
+    for (const reference of specContext.lineReferences ?? []) {
+      lineReferenceCounts.set(reference.file, (lineReferenceCounts.get(reference.file) ?? 0) + 1);
+    }
+    const scoredFiles = [...specContext.existingFiles]
+      .sort((a, b) =>
+        (lineReferenceCounts.get(b) ?? 0) - (lineReferenceCounts.get(a) ?? 0)
+        || this.specEntryKindWeight(b) - this.specEntryKindWeight(a)
+        || a.localeCompare(b),
+      );
+
+    for (const file of scoredFiles.slice(0, maxCandidates)) {
+      const lineReferences = lineReferenceCounts.get(file) ?? 0;
+      candidates.push({
+        file,
+        confidence: lineReferences > 0 ? 0.99 : 0.94,
+        reasons: [
+          lineReferences > 0
+            ? `listed in spec ${specContext.file} with line reference`
+            : `listed in spec ${specContext.file}`,
+        ],
+      });
+    }
+
+    if (candidates.length < maxCandidates) {
+      candidates.push({
+        file: specContext.file,
+        confidence: 0.94,
+        reasons: ['provided spec document'],
+      });
+    }
+
+    return candidates.slice(0, maxCandidates);
+  }
+
+  private specEntryKindWeight(file: string): number {
+    const kind = this.inferKindForPath(file);
+    switch (kind) {
+      case 'inertia_page':
+        return 90;
+      case 'composable':
+        return 86;
+      case 'action':
+        return 82;
+      case 'service':
+        return 81;
+      case 'config_array':
+        return 80;
+      case 'component':
+        return 76;
+      default:
+        return 50;
+    }
   }
 
   private inferEntryCandidates(
@@ -1289,6 +3966,7 @@ export class Weave {
     const taskFocus = profile.focus;
     const allNodes = this.store.getAllNodes()
       .filter(node => !this.isGeneratedPath(node.filePath))
+      .filter(node => !this.isBootstrapNoisePath(node.filePath))
       .filter(node => node.kind !== 'file')
       .filter(node => prefersTests || !node.filePath.startsWith('tests/'));
 
@@ -1298,11 +3976,11 @@ export class Weave {
       reasons: Set<string>;
     }>();
 
-    for (const node of allNodes) {
-      const score = this.scoreNodeForTask(node, terms, prefersTests, taskFocus, profile.mode);
-      if (score <= 0) {
-        continue;
-      }
+	    for (const node of allNodes) {
+	      const score = this.scoreNodeForTask(node, terms, prefersTests, taskFocus, profile.mode);
+	      if (score <= 0) {
+	        continue;
+	      }
 
       const entry = fileScores.get(node.filePath) ?? {
         bestScore: 0,
@@ -1311,17 +3989,15 @@ export class Weave {
       };
       entry.bestScore = Math.max(entry.bestScore, score);
       const reason = this.nodeReasonForTask(node, terms);
-      if (reason) {
-        entry.reasons.add(reason);
-      }
-      for (const term of terms) {
-        if (
-          node.filePath.toLowerCase().includes(term)
-          || node.symbolName.toLowerCase().includes(term)
-        ) {
-          entry.matchedTerms.add(term);
-        }
-      }
+	      if (reason) {
+	        entry.reasons.add(reason);
+	      }
+	      const searchTokens = this.searchTokensForText(`${node.filePath} ${node.symbolName}`);
+	      for (const term of this.rankableTaskTerms(terms)) {
+	        if (searchTokens.has(term)) {
+	          entry.matchedTerms.add(term);
+	        }
+	      }
       fileScores.set(node.filePath, entry);
     }
 
@@ -1330,7 +4006,22 @@ export class Weave {
 
     if (scored.length === 0) {
       const fallback = this.fallbackEntryCandidates(maxCandidates);
-      return fallback;
+      return profile.creationLike
+        ? fallback.map(candidate => ({
+            ...candidate,
+            confidence: 0.35,
+            reasons: ['weak fallback: no strong graph evidence for dominant task terms'],
+          }))
+        : fallback;
+    }
+
+    if (this.shouldUseWeakBootstrapFallback(profile, scored)) {
+      return this.fallbackEntryCandidates(maxCandidates)
+        .map(candidate => ({
+          ...candidate,
+          confidence: 0.35,
+          reasons: ['weak fallback: no strong graph evidence for dominant task terms'],
+        }));
     }
 
     const maxScore = this.entryCandidateScore(scored[0]?.[1]) ?? 1;
@@ -1343,6 +4034,13 @@ export class Weave {
       }));
   }
 
+  private hasWeakBootstrapEvidence(candidates: BootstrapEntryCandidate[]): boolean {
+    return candidates.length > 0
+      && candidates.every(candidate =>
+        candidate.reasons.some(reason => reason.startsWith('weak fallback:')),
+      );
+  }
+
   private entryCandidateScore(entry: {
     bestScore: number;
     matchedTerms: Set<string>;
@@ -1352,9 +4050,36 @@ export class Weave {
       return 0;
     }
 
+    const strongMatches = Array.from(entry.matchedTerms)
+      .filter(term => !this.isLowSignalTaskTerm(term));
+    const lowSignalOnlyPenalty = entry.matchedTerms.size > 0 && strongMatches.length === 0 ? 10 : 0;
+
     return entry.bestScore
-      + Math.min(9, entry.matchedTerms.size * 3)
-      + Math.min(3, entry.reasons.size);
+      + Math.min(12, strongMatches.length * 4)
+      + Math.min(3, (entry.matchedTerms.size - strongMatches.length))
+      + Math.min(3, entry.reasons.size)
+      - lowSignalOnlyPenalty;
+  }
+
+  private shouldUseWeakBootstrapFallback(
+    profile: TaskProfile,
+    scored: Array<[string, { matchedTerms: Set<string> }]>,
+  ): boolean {
+    if (!profile.creationLike || profile.mode !== 'implementation') {
+      return false;
+    }
+    if (profile.endpointLiterals.length > 0 || profile.specContext) {
+      return false;
+    }
+
+    const dominantTerms = this.significantTaskTerms(profile.terms).slice(0, 3);
+    if (dominantTerms.length === 0) {
+      return false;
+    }
+
+    return !scored.some(([_file, entry]) =>
+      dominantTerms.some(term => entry.matchedTerms.has(term)),
+    );
   }
 
   private extractTaskTerms(task: string): string[] {
@@ -1363,15 +4088,66 @@ export class Weave {
       'from', 'into', 'by', 'or', 'if', 'is', 'it', 'this', 'that', 'add', 'update',
       'change', 'fix', 'make', 'use', 'new', 'existing', 'line', 'text', 'copy',
       'short', 'small', 'real', 'task', 'build', 'create', 'implement', 'scaffold',
-      'wire', 'wiring', 'composable', 'composables',
-    ]);
+      'wire', 'wiring', 'feature', 'features', 'composable', 'composables', 'action', 'actions', 'route',
+	      'routes', 'api', 'endpoint', 'endpoints',
+	      'doc', 'docs', 'section', 'reference', 'possible', 'maybe', 'note',
+	    ]);
 
-    return task
+    return this.stripEndpointLiterals(task)
+      .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
       .toLowerCase()
-      .split(/[^a-z0-9/]+/)
+      .split(/[^a-z0-9]+/)
       .map(term => term.trim())
+      .map(term => this.normalizeTaskTerm(term))
       .filter(term => term.length >= 3)
       .filter(term => !stopwords.has(term));
+  }
+
+  private normalizeTaskTerm(term: string): string {
+    if (term.length > 4 && term.endsWith('ies')) {
+      return `${term.slice(0, -3)}y`;
+    }
+    if (term.length > 5 && term.endsWith('ing')) {
+      return term.slice(0, -3);
+    }
+    if (term.length > 4 && term.endsWith('ed')) {
+      return term.slice(0, -2);
+    }
+    if (term.length > 4 && term.endsWith('s')) {
+      return term.slice(0, -1);
+    }
+    return term;
+  }
+
+  private rankableTaskTerms(terms: string[]): string[] {
+    return Array.from(new Set(
+      terms
+        .map(term => this.normalizeTaskTerm(term.toLowerCase()))
+        .filter(term => term.length >= 4)
+        .filter(term => !this.isLowSignalTaskTerm(term)),
+    ));
+  }
+
+  private searchTokensForText(value: string): Set<string> {
+    return new Set(
+      value
+        .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+        .toLowerCase()
+        .split(/[^a-z0-9]+/)
+        .map(term => this.normalizeTaskTerm(term.trim()))
+        .filter(term => term.length >= 3),
+    );
+  }
+
+  private textMatchesAnyRankableTerm(value: string, terms: string[]): boolean {
+    const tokens = this.searchTokensForText(value);
+    return this.rankableTaskTerms(terms).some(term => tokens.has(term));
+  }
+
+  private fileBasenameMatchesTerm(filePath: string, term: string): boolean {
+    const base = basename(filePath)
+      .replace(/\.[^.]+$/, '');
+    return this.searchTokensForText(base).has(term);
   }
 
   private taskPrefersTests(terms: string[]): boolean {
@@ -1383,7 +4159,7 @@ export class Weave {
       return 'implementation';
     }
 
-    const lowerTask = task.toLowerCase();
+    const lowerTask = this.stripEndpointLiterals(task).toLowerCase();
     const auditSignals = ['audit', 'architecture', 'research', 'trace', 'analyze', 'assessment', 'investigate'];
     const communicationSignals = [
       'communication', 'realtime', 'real-time', 'websocket', 'websockets', 'sse', 'polling',
@@ -1404,48 +4180,65 @@ export class Weave {
 
   private expandTaskTerms(terms: string[], task: string, mode: TaskMode): string[] {
     const expanded = new Set(terms);
-    const lowerTask = task.toLowerCase();
-
     if (mode === 'audit_communication') {
       [
-        'campaign',
-        'turn',
-        'turns',
-        'engine',
         'client',
+        'clients',
+        'service',
+        'services',
+        'integration',
+        'integrations',
         'event',
         'events',
         'stream',
+        'streaming',
         'sse',
-        'resume',
+        'socket',
+        'sockets',
+        'websocket',
+        'websockets',
         'poll',
         'polling',
         'keepalive',
-        'combat',
+        'transport',
+        'http',
+        'network',
+        'request',
+        'requests',
+        'response',
+        'responses',
+        'endpoint',
+        'endpoints',
+        'route',
+        'routes',
         'status',
         'api',
       ].forEach(term => expanded.add(term));
     }
 
-    if (lowerTask.includes('game engine')) {
-      expanded.add('game');
-      expanded.add('engine');
-    }
-
     return Array.from(expanded);
   }
 
-  private buildTaskProfile(task: string): TaskProfile {
+  private buildTaskProfile(
+    task: string,
+    specContext: BootstrapSpecContext | null = null,
+  ): TaskProfile {
     const baseTerms = this.extractTaskTerms(task);
     const prefersTests = this.taskPrefersTests(baseTerms);
     const mode = this.inferTaskMode(task, prefersTests);
-    const terms = this.expandTaskTerms(baseTerms, task, mode);
-    const lowerTask = task.toLowerCase();
+    const endpointLiterals = this.extractEndpointLiterals(task);
+    const expandedTerms = this.expandTaskTerms(baseTerms, task, mode);
+    const terms = endpointLiterals.length > 0
+      ? Array.from(new Set([...expandedTerms, 'http', 'network']))
+      : expandedTerms;
+    const lowerTask = this.stripEndpointLiterals(task).toLowerCase();
     return {
       mode,
       focus: mode === 'audit_communication' ? 'mixed' : this.inferTaskFocus(task, prefersTests),
       prefersTests,
       terms,
+      endpointLiterals,
+      specContext,
       creationLike: /\b(add|build|create|implement|introduce|scaffold|wire|new)\b/.test(lowerTask),
     };
   }
@@ -1458,12 +4251,13 @@ export class Weave {
       return 'tests';
     }
 
-    const lowerTask = task.toLowerCase();
+    const lowerTask = this.stripEndpointLiterals(task).toLowerCase();
     const frontendTerms = [
       'page', 'component', 'copy', 'text', 'message', 'label', 'button', 'modal',
       'layout', 'form', 'input', 'header', 'footer', 'tooltip', 'dropdown',
-      'screen', 'view', 'ui', 'composable', 'resolver', 'music', 'audio', 'atmosphere',
-      'debug', 'panel', 'dice', 'overlay', 'slider', 'toggle',
+      'screen', 'view', 'ui', 'composable', 'resolver',
+      'debug', 'panel', 'overlay', 'slider', 'toggle', 'frontend',
+      'dispatcher', 'browser', 'vue', 'javascript',
     ];
     const backendTerms = [
       'action', 'route', 'request', 'validation', 'validate', 'model', 'migration',
@@ -1488,13 +4282,24 @@ export class Weave {
   ): number {
     const file = node.filePath.toLowerCase();
     const symbol = node.symbolName.toLowerCase();
-    let score = this.bundleKindPriority(node.kind) * 0.05
-      + this.pathBootstrapWeight(file, prefersTests, taskFocus, taskMode, terms);
+    const fileTokens = this.searchTokensForText(node.filePath);
+    const symbolTokens = this.searchTokensForText(node.symbolName);
+    const rankableTerms = this.rankableTaskTerms(terms);
+    const matchedTerms = rankableTerms.filter(term =>
+      fileTokens.has(term) || symbolTokens.has(term),
+    );
+    if (taskMode === 'implementation' && matchedTerms.length === 0) {
+      return 0;
+    }
 
-    for (const term of terms) {
-      if (file.includes(term)) score += 6;
-      if (symbol.includes(term)) score += this.isLowSignalTaskTerm(term) ? 1 : 5;
-      if (file.endsWith(`/${term}.vue`) || file.endsWith(`/${term}.php`) || file.endsWith(`/${term}.ts`)) {
+    let score = this.bundleKindPriority(node.kind) * 0.05
+      + this.pathBootstrapWeight(file, prefersTests, taskFocus, taskMode, terms)
+      + Math.min(24, matchedTerms.length * 6);
+
+    for (const term of matchedTerms) {
+      if (fileTokens.has(term)) score += 6;
+      if (symbolTokens.has(term)) score += 5;
+      if (this.fileBasenameMatchesTerm(file, term)) {
         score += 4;
       }
     }
@@ -1503,13 +4308,13 @@ export class Weave {
       score -= 18;
     }
 
-    if (node.kind === 'action' && terms.some(term => file.includes(term) || symbol.includes(term))) {
+    if (node.kind === 'action' && matchedTerms.length > 0) {
       score += 4;
     }
-    if (node.kind === 'inertia_page' && terms.some(term => file.includes(term) || symbol.includes(term))) {
+    if (node.kind === 'inertia_page' && matchedTerms.length > 0) {
       score += 4;
     }
-    if (node.kind === 'component' && terms.some(term => file.includes(term) || symbol.includes(term))) {
+    if (node.kind === 'component' && matchedTerms.length > 0) {
       score += 3;
     }
 
@@ -1547,6 +4352,13 @@ export class Weave {
       score += 3 + (taskFocus === 'backend' ? 3 : 1);
       if (taskFocus === 'frontend') score -= 6;
     }
+    if (taskFocus === 'frontend' && filePath.startsWith('app/Actions/')) {
+      const pathTokens = this.searchTokensForText(filePath);
+      const hasSpecificTaskTerm = this.rankableTaskTerms(terms).some(term => pathTokens.has(term));
+      if (!hasSpecificTaskTerm) {
+        score -= 10;
+      }
+    }
     if (filePath.startsWith('app/Models/')) {
       score += 3 + (taskFocus === 'backend' ? 3 : 1);
       if (taskFocus === 'frontend') score -= 3;
@@ -1556,34 +4368,21 @@ export class Weave {
     }
     if (taskMode === 'audit_communication') {
       const wantsBrowseSurfaces = this.auditCommunicationWantsBrowseSurfaces(terms);
-      if (filePath.startsWith('app/Clients/')) score += 18;
-      if (filePath.includes('/Campaign/')) score += 8;
-      if (filePath.endsWith('/Campaign/Turns.vue')) score += 18;
-      if (filePath.includes('/Actions/') && filePath.includes('/Turn/')) score += 16;
-      if (filePath.includes('/Actions/') && filePath.includes('/Events/')) score += 15;
-      if (filePath.endsWith('/Turns.vue')) score += 16;
-      if (filePath.includes('useCampaignEvents')) score += 16;
-      if (filePath.includes('useTurnResume')) score += 16;
-      if (filePath.includes('useEngineCombat')) score += 14;
-      if (filePath.endsWith('/Scripts/api.js')) score += 15;
-      if (filePath === 'routes/api.php') score += 12;
-      if (filePath === 'config/services.php') score += 11;
-      if (filePath === 'app/Providers/AppServiceProvider.php') score += 10;
-      if (filePath.includes('/Admin/') && !terms.includes('admin')) score -= 60;
+      score += this.communicationPathWeight(filePath, terms);
+      if (filePath.includes('/Admin/') && !terms.includes('admin')) score -= 24;
       if (this.isBrowseSurfacePath(filePath) && !wantsBrowseSurfaces) score -= 36;
-      if ((filePath.includes('/Hooks/') || filePath.includes('HookAction')) && !terms.includes('hook')) score -= 14;
-      if (filePath.includes('TwoFactor') && !terms.includes('factor')) score -= 10;
-      if (filePath.includes('CreateUserAction') && !terms.includes('user')) score -= 8;
     }
     return score;
   }
 
   private nodeReasonForTask(node: WeaveNode, terms: string[]): string | null {
-    for (const term of terms) {
-      if (node.filePath.toLowerCase().includes(term)) {
+    const fileTokens = this.searchTokensForText(node.filePath);
+    const symbolTokens = this.searchTokensForText(node.symbolName);
+    for (const term of this.rankableTaskTerms(terms)) {
+      if (fileTokens.has(term)) {
         return `task term "${term}" matches file path`;
       }
-      if (node.symbolName.toLowerCase().includes(term) && !this.isLowSignalTaskTerm(term)) {
+      if (symbolTokens.has(term)) {
         return `task term "${term}" matches symbol`;
       }
     }
@@ -1594,9 +4393,10 @@ export class Weave {
     const candidates: BootstrapEntryCandidate[] = [];
     const seenFiles = new Set<string>();
 
-    for (const kind of ['action', 'inertia_page', 'component', 'method']) {
+    for (const kind of ['action', 'inertia_page', 'model', 'migration', 'form_request', 'component', 'method', 'spec']) {
       const nodes = this.store.getNodesByKind(kind)
         .filter(node => !this.isGeneratedPath(node.filePath))
+        .filter(node => !this.isBootstrapNoisePath(node.filePath))
         .filter(node => kind !== 'method' || node.symbolName.endsWith('::asController'));
 
       for (const node of nodes) {
@@ -1637,8 +4437,19 @@ export class Weave {
       });
     }
 
+    if (taskProfile.specContext) {
+      for (const candidate of this.inferSpecEntryCandidates(taskProfile.specContext, maxCandidates)) {
+        add(candidate);
+      }
+    }
+
     const inferred = this.inferEntryCandidates(query.task, maxCandidates, taskProfile);
     for (const candidate of inferred) {
+      add(candidate);
+    }
+
+    const endpointCandidates = this.inferEndpointLiteralCandidates(taskProfile, maxCandidates);
+    for (const candidate of endpointCandidates) {
       add(candidate);
     }
 
@@ -1666,7 +4477,10 @@ export class Weave {
     }
 
     const candidates = Array.from(merged.values())
-      .sort((a, b) => b.confidence - a.confidence || a.file.localeCompare(b.file))
+      .sort((a, b) =>
+        this.bootstrapCandidateSortScore(b, taskProfile) - this.bootstrapCandidateSortScore(a, taskProfile)
+        || a.file.localeCompare(b.file),
+      )
       .slice(0, maxCandidates * 2);
 
     return this.filterBootstrapEntryCandidates(candidates, query, taskProfile)
@@ -1678,7 +4492,10 @@ export class Weave {
     query: BootstrapQuery,
     taskProfile: TaskProfile,
   ): BootstrapEntryCandidate[] {
-    const frontendFiltered = this.filterFrontendImplementationCandidates(candidates, query, taskProfile);
+    const noiseFiltered = query.start
+      ? candidates
+      : candidates.filter(candidate => !this.isBootstrapNoisePath(candidate.file));
+    const frontendFiltered = this.filterFrontendImplementationCandidates(noiseFiltered, query, taskProfile);
 
     if (taskProfile.mode !== 'audit_communication' || taskProfile.terms.includes('admin')) {
       return this.filterBrowseEntryCandidates(frontendFiltered, query, taskProfile);
@@ -1690,6 +4507,30 @@ export class Weave {
     );
 
     return this.filterBrowseEntryCandidates(preferred.length > 0 ? preferred : frontendFiltered, query, taskProfile);
+  }
+
+  private bootstrapCandidateSortScore(
+    candidate: BootstrapEntryCandidate,
+    taskProfile: TaskProfile,
+  ): number {
+    let score = candidate.confidence * 100;
+    score += this.fileTermMatchScore(candidate.file, this.significantTaskTerms(taskProfile.terms)) * 2;
+    if (candidate.reasons.some(reason => reason.startsWith('task term '))) {
+      score += 12;
+    }
+    if (candidate.reasons.some(reason => reason.startsWith('weak fallback:'))) {
+      score -= 80;
+    }
+    if (candidate.reasons.some(reason => reason.startsWith('provided') || reason.startsWith('listed in spec'))) {
+      score += 20;
+    }
+    if (candidate.reasons.some(reason => reason.includes('with line reference'))) {
+      score += 60;
+    }
+    if (candidate.reasons.some(reason => reason === 'provided spec document')) {
+      score -= 30;
+    }
+    return score;
   }
 
   private filterFrontendImplementationCandidates(
@@ -1759,16 +4600,13 @@ export class Weave {
 
     for (const node of candidates) {
       const file = node.filePath;
-      let score = 0;
+      const source = this.readProjectTextFile(file);
+      let score = this.communicationPathWeight(file, taskProfile?.terms ?? [])
+        + this.communicationSourceWeight(source ?? '');
 
-      if (file.endsWith('/Campaign/Turns.vue')) score += 44;
-      if (file.includes('useCampaignEvents')) score += 40;
-      if (file.includes('useTurnResume')) score += 38;
-      if (file.includes('useEngineCombat')) score += 39;
-      if (file.endsWith('/Scripts/api.js')) score += 38;
-      if (file === 'routes/api.php') score += 22;
-      if (file.includes('/Campaign/Events/')) score += 20;
-      if (file.includes('/Campaign/Turn/')) score += 18;
+      if (taskProfile) {
+        score += this.fileTermMatchScore(file, this.significantTaskTerms(taskProfile.terms));
+      }
       if (this.isBrowseSurfacePath(file) && !wantsBrowseSurfaces) score -= 30;
 
       if (score <= 0) {
@@ -1955,6 +4793,70 @@ export class Weave {
     ].includes(term));
   }
 
+  private communicationPathWeight(filePath: string, terms: string[]): number {
+    const lower = filePath.toLowerCase();
+    let score = 0;
+
+    if (this.isServiceClientPath(lower)) score += 18;
+    if (this.isApiRoutePath(lower)) score += 14;
+    if (this.isHttpHelperPath(lower)) score += 16;
+    if (this.isCommunicationFrontendPath(lower)) score += 14;
+    if (this.isCommunicationBackendPath(lower)) score += 12;
+    if (lower.startsWith('config/')) score += this.pathHasCommunicationKeyword(lower) ? 10 : 4;
+    if (lower.startsWith('app/providers/') || lower.startsWith('src/providers/')) score += 8;
+
+    const termScore = this.fileTermMatchScore(filePath, this.significantTaskTerms(terms));
+    if (termScore > 0) {
+      score += Math.min(18, termScore);
+    }
+
+    return score;
+  }
+
+  private communicationSourceWeight(source: string): number {
+    if (!source) {
+      return 0;
+    }
+
+    let score = 0;
+    if (/\b(?:fetch|axios|postWithKeepalive|EventSource|WebSocket|XMLHttpRequest)\b/.test(source)) score += 18;
+    if (/\brouter\.(?:get|post|put|patch|delete|visit)\b/.test(source)) score += 12;
+    if (/\bRoute::(?:get|post|put|patch|delete|apiResource|resource)\b/.test(source)) score += 12;
+    if (/\b(?:Http::|GuzzleHttp|curl_exec)\b/.test(source)) score += 12;
+    if (/\b(?:stream|poll|subscribe|publish|emit|listen|socket|keepalive)\b/i.test(source)) score += 10;
+    return score;
+  }
+
+  private isServiceClientPath(lowerPath: string): boolean {
+    return /^(?:app|src)\/(?:clients|services|integrations|gateways|adapters)\//.test(lowerPath)
+      || /\/(?:clients|services|integrations|gateways|adapters)\//.test(lowerPath);
+  }
+
+  private isApiRoutePath(lowerPath: string): boolean {
+    return lowerPath === 'routes/api.php'
+      || lowerPath.startsWith('routes/')
+      || /(?:^|\/)(?:api|routes?)\.(?:php|js|ts)$/.test(lowerPath);
+  }
+
+  private isHttpHelperPath(lowerPath: string): boolean {
+    return /(?:^|\/)(?:api|http|client|request|transport|keepalive)\.(?:js|ts|php)$/.test(lowerPath)
+      || /\/(?:api|http|network|transport)\//.test(lowerPath);
+  }
+
+  private isCommunicationFrontendPath(lowerPath: string): boolean {
+    return lowerPath.startsWith('resources/js/')
+      && this.pathHasCommunicationKeyword(lowerPath);
+  }
+
+  private isCommunicationBackendPath(lowerPath: string): boolean {
+    return /^(?:app|src)\/(?:actions|controllers|jobs|listeners|events|commands)\//.test(lowerPath)
+      && this.pathHasCommunicationKeyword(lowerPath);
+  }
+
+  private pathHasCommunicationKeyword(lowerPath: string): boolean {
+    return /(?:event|stream|socket|websocket|sse|poll|transport|client|api|http|request|response|sync|channel|keepalive|subscribe|publish)/.test(lowerPath);
+  }
+
   private isBrowseSurfacePath(filePath: string): boolean {
     return /\/(?:List|Index|Browse|History)[^/]*\.(?:php|vue|ts|js)$/i.test(filePath);
   }
@@ -1965,32 +4867,490 @@ export class Weave {
 
   private isLowSignalTaskTerm(term: string): boolean {
     return [
+      'action',
+      'actions',
+      'route',
+      'routes',
+      'api',
+      'endpoint',
+      'endpoints',
       'test',
       'tests',
-      'debug',
-      'panel',
       'control',
       'controls',
       'roll',
       'feature',
       'features',
-      'component',
-      'components',
-      'page',
-      'pages',
-    ].includes(term);
-  }
+      'user',
+      'users',
+      'member',
+      'members',
+      'scoped',
+	      'component',
+	      'components',
+	      'page',
+	      'pages',
+	      'doc',
+	      'docs',
+	      'section',
+	      'reference',
+	      'possible',
+	      'maybe',
+	      'note',
+	    ].includes(term);
+	  }
 
   private significantTaskTerms(terms: string[]): string[] {
     const filtered = terms.filter(term => !this.isLowSignalTaskTerm(term));
     return filtered.length > 0 ? filtered : terms;
   }
 
+  private inferEndpointLiteralCandidates(
+    taskProfile: TaskProfile,
+    maxCandidates: number,
+  ): BootstrapEntryCandidate[] {
+    const scored = this.scoreEndpointLiteralFiles(taskProfile);
+    if (scored.length === 0) {
+      return [];
+    }
+
+    const maxScore = scored[0]?.score ?? 1;
+    return scored
+      .slice(0, maxCandidates)
+      .map(candidate => ({
+        file: candidate.file,
+        confidence: Math.max(0.68, Math.min(0.97, candidate.score / maxScore)),
+        reasons: Array.from(candidate.reasons).slice(0, 3),
+      }));
+  }
+
+  private scoreEndpointLiteralFiles(taskProfile: TaskProfile): Array<{
+    file: string;
+    score: number;
+    reasons: Set<string>;
+  }> {
+    if (taskProfile.endpointLiterals.length === 0) {
+      return [];
+    }
+
+    const files = this.indexedProjectFiles()
+      .filter(file => !this.isGeneratedPath(file))
+      .filter(file => taskProfile.prefersTests || !file.startsWith('tests/'))
+      .filter(file => this.isEndpointSearchableFile(file));
+
+    const scored: Array<{ file: string; score: number; reasons: Set<string> }> = [];
+    for (const file of files) {
+      const source = this.readProjectTextFile(file);
+      if (!source) {
+        continue;
+      }
+
+      const result = this.scoreFileForEndpointLiterals(file, source, taskProfile);
+      if (result.score > 0) {
+        scored.push({ file, ...result });
+      }
+    }
+
+    return scored.sort((a, b) => b.score - a.score || a.file.localeCompare(b.file));
+  }
+
+  private scoreFileForEndpointLiterals(
+    file: string,
+    source: string,
+    taskProfile: TaskProfile,
+  ): { score: number; reasons: Set<string> } {
+    const lowerFile = file.toLowerCase();
+    const lowerSource = source.toLowerCase();
+    const searchable = `${lowerFile}\n${lowerSource}`;
+    const endpointCarrier = this.isEndpointCarrierFile(file, source);
+    const reasons = new Set<string>();
+    let score = 0;
+
+    for (const literal of taskProfile.endpointLiterals) {
+      const lowerLiteral = literal.toLowerCase();
+      const segments = this.endpointSegments(literal);
+      if (segments.length === 0) {
+        continue;
+      }
+
+      const exactMatch = lowerSource.includes(lowerLiteral);
+      const matchedSegments = segments.filter(segment =>
+        this.endpointSegmentMatches(searchable, endpointCarrier, segment),
+      );
+      const allSegmentsMatched = matchedSegments.length === segments.length;
+
+      if (exactMatch) {
+        score += 70;
+        reasons.add(`contains endpoint literal ${literal}`);
+      } else if (allSegmentsMatched) {
+        score += endpointCarrier ? 55 : 30;
+        reasons.add(`matches endpoint path segments for ${literal}`);
+      } else if (matchedSegments.length >= Math.min(2, segments.length)) {
+        score += endpointCarrier ? 24 : 12;
+        reasons.add(`partially matches endpoint path segments for ${literal}`);
+      }
+    }
+
+    if (score <= 0) {
+      return { score: 0, reasons };
+    }
+
+    if (this.isFrontendFile(file)) {
+      score += 24;
+      reasons.add('frontend endpoint caller candidate');
+    }
+    if (file.startsWith('resources/js/composables/')) {
+      score += 18;
+      reasons.add('frontend composable endpoint surface');
+    }
+    if (file.startsWith('resources/js/Pages/')) {
+      score += 10;
+    }
+    if (file === 'routes/api.php' || file === 'routes/web.php') {
+      score += 22;
+      reasons.add('route table defines endpoint paths');
+    }
+    if (/\b(postWithKeepalive|fetch|axios|router\.(?:get|post|put|patch|delete)|api\.)\b/.test(source)) {
+      score += this.isFrontendFile(file) ? 18 : 8;
+      reasons.add('contains HTTP client call surface');
+    }
+    if (/\bACTION_PATHS\b/.test(source) || /\b(?:move|attack|cast|end_turn|death_save)\s*:/.test(source)) {
+      score += 16;
+      reasons.add('contains endpoint action dispatcher map');
+    }
+    if (lowerFile.startsWith('app/actions/') && !taskProfile.terms.some(term => lowerFile.includes(term))) {
+      score -= 18;
+    }
+    if (this.isBrowseSurfacePath(file)) {
+      score -= 24;
+    }
+
+    return { score, reasons };
+  }
+
+  private extractEndpointLiterals(task: string): string[] {
+    const endpoints = new Set<string>();
+    const pattern = /(^|[\s`'"])(\/[A-Za-z0-9_$:{}./-]+)/g;
+    for (const match of task.matchAll(pattern)) {
+      const endpoint = this.normalizeEndpointLiteral(match[2] ?? '');
+      if (endpoint) {
+        endpoints.add(endpoint);
+      }
+    }
+    return Array.from(endpoints);
+  }
+
+  private stripEndpointLiterals(task: string): string {
+    return task.replace(/(^|[\s`'"])(\/[A-Za-z0-9_$:{}./-]+)/g, '$1 ');
+  }
+
+  private normalizeEndpointLiteral(value: string): string | null {
+    const endpoint = value
+      .trim()
+      .replace(/[),.;:]+$/g, '')
+      .replace(/\/+$/g, '');
+
+    if (!endpoint.startsWith('/') || endpoint.startsWith('//')) {
+      return null;
+    }
+    if (!/[a-z]/i.test(endpoint) || endpoint.split('/').filter(Boolean).length === 0) {
+      return null;
+    }
+
+    return endpoint;
+  }
+
+  private endpointSegments(endpoint: string): string[] {
+    const ignored = new Set(['api', 'dev', 'v1', 'v2']);
+    return endpoint
+      .toLowerCase()
+      .split('/')
+      .map(segment => segment.trim())
+      .filter(Boolean)
+      .filter(segment => !ignored.has(segment))
+      .filter(segment => !/^\{[^}]+\}$/.test(segment))
+      .filter(segment => !/^\$\{[^}]+\}$/.test(segment))
+      .filter(segment => !/^:[a-z0-9_]+$/.test(segment))
+      .map(segment => segment.replace(/[^a-z0-9_-]/g, ''))
+      .filter(segment => segment.length >= 2);
+  }
+
+  private indexedProjectFiles(): string[] {
+    const cachedFiles = this.store.getAllFileCache().map(entry => this.toRelativePath(entry.filePath));
+    if (cachedFiles.length > 0) {
+      return Array.from(new Set(cachedFiles));
+    }
+
+    return Array.from(new Set(this.store.getAllNodes().map(node => node.filePath)));
+  }
+
+  private isEndpointSearchableFile(file: string): boolean {
+    return /\.(php|js|ts|vue|tsx|jsx)$/i.test(file)
+      && !file.includes('/node_modules/')
+      && !file.includes('/vendor/');
+  }
+
+  private isEndpointCarrierFile(file: string, source: string): boolean {
+    return file.startsWith('routes/')
+      || this.isFrontendFile(file)
+      || /\b(?:Route::|fetch|axios|postWithKeepalive|router\.(?:get|post|put|patch|delete)|api\.)\b/.test(source);
+  }
+
+  private endpointSegmentMatches(
+    searchable: string,
+    endpointCarrier: boolean,
+    segment: string,
+  ): boolean {
+    if (!endpointCarrier && ['action', 'actions', 'route', 'routes', 'api', 'endpoint', 'endpoints'].includes(segment)) {
+      return false;
+    }
+
+    return searchable.includes(segment);
+  }
+
+  private isFrontendFile(file: string): boolean {
+    return file.startsWith('resources/js/');
+  }
+
+  private detectScopeMismatch(
+    taskProfile: TaskProfile,
+    workingSet: ContextFile[],
+  ): {
+    expectedFocus: 'frontend' | 'backend' | 'tests';
+    actualFocus: 'frontend' | 'backend' | 'tests' | 'mixed' | 'unknown';
+    reason: string;
+  } | null {
+    if (taskProfile.focus === 'mixed') {
+      return null;
+    }
+
+    const actualFocus = this.inferWorkingSetFocus(workingSet);
+    if (actualFocus === 'unknown' || actualFocus === 'mixed' || actualFocus === taskProfile.focus) {
+      return null;
+    }
+
+    return {
+      expectedFocus: taskProfile.focus,
+      actualFocus,
+      reason: `Task appears ${taskProfile.focus}-focused, but the working set is ${actualFocus}-focused. Widen narrowly or rerun bootstrap with an explicit scope hint before editing.`,
+    };
+  }
+
+  private buildBootstrapWarnings(
+    taskProfile: TaskProfile,
+    workingSet: ContextFile[],
+  ): BootstrapWarning[] {
+    const warnings: BootstrapWarning[] = [];
+    const specContext = taskProfile.specContext;
+
+    if (specContext?.novelPathPrefixes.length) {
+      warnings.push({
+        code: 'novel_path_prefixes',
+        message: 'Spec references files under path prefixes not currently present in the project.',
+        files: specContext.novelPathPrefixes,
+      });
+    }
+
+    if (specContext?.suspiciousReferences.length) {
+      warnings.push({
+        code: 'suspicious_spec_references',
+        message: 'Some spec references looked like libraries or unresolved bare filenames rather than project paths.',
+        files: specContext.suspiciousReferences,
+      });
+    }
+
+    const plannedEvidenceGaps = specContext ? this.plannedFileEvidenceGaps(specContext) : [];
+    if (plannedEvidenceGaps.length > 0) {
+      warnings.push({
+        code: 'planned_file_evidence_gaps',
+        message: 'Some planned files have weak or missing indexed evidence; treat these as invention zones and verify manually instead of assuming Weave knows the pattern.',
+        files: plannedEvidenceGaps.map(gap => gap.file),
+        details: {
+          gaps: plannedEvidenceGaps,
+        },
+      });
+    }
+
+    const unmatchedTaskTerms = this.unmatchedTaskTermsForSpec(taskProfile);
+    if (unmatchedTaskTerms.length > 0) {
+      warnings.push({
+        code: 'spec_task_term_mismatch',
+        message: 'The task contains important terms that do not appear in the spec; verify whether the prompt and spec describe the same work before editing.',
+        terms: unmatchedTaskTerms,
+      });
+    }
+
+    const highFanoutFiles = workingSet
+      .filter(file => this.isHighFanoutFile(file.file))
+      .map(file => file.file);
+    if (highFanoutFiles.length > 0) {
+      warnings.push({
+        code: 'high_fanout_entry',
+        message: 'Some working-set files have many graph relationships; their neighbors may be noisy. Prefer spec-listed files or narrower query targets for localized edits.',
+        files: highFanoutFiles,
+      });
+    }
+
+    const diagnostics = this.getDiagnosticsSnapshot();
+    const issueCount = diagnostics.totals.issues;
+    if (issueCount > 0) {
+      warnings.push({
+        code: 'indexing_diagnostics_issues',
+        message: 'The index has unresolved extraction issues; high-level graph context is usable, but inspect weave_status before trusting missing edges as absence.',
+        details: {
+          issueCount,
+          queryErrors: diagnostics.totals.queryErrors,
+          l2EdgesSkipped: diagnostics.totals.l2EdgesSkipped,
+          l3EdgesSkipped: diagnostics.totals.l3EdgesSkipped,
+        },
+      });
+    }
+
+    return warnings;
+  }
+
+  private plannedFileEvidenceGaps(specContext: BootstrapSpecContext): Array<{
+    file: string;
+    kind: string | null;
+    issues: string[];
+    exemplarFile: string | null;
+    confidence: number;
+  }> {
+    const gaps: Array<{
+      file: string;
+      kind: string | null;
+      issues: string[];
+      exemplarFile: string | null;
+      confidence: number;
+    }> = [];
+
+    for (const exemplar of specContext.likelyNewFileExemplars ?? []) {
+      const issues: string[] = [];
+      if (!exemplar.kind) {
+        issues.push('no kind inferred');
+      }
+      if (!exemplar.exemplarFile) {
+        issues.push('no indexed exemplar');
+      }
+      if (exemplar.kind) {
+        const conventions = this.conventionEngine
+          .getConventions(this.normalizeKindAlias(exemplar.kind))
+          .filter(convention => convention.confidence >= 0.9);
+        if (conventions.length === 0) {
+          issues.push('no high-confidence conventions');
+        }
+      }
+      if (exemplar.confidence < 0.75) {
+        issues.push('low exemplar confidence');
+      }
+
+      if (issues.length > 0) {
+        gaps.push({
+          file: exemplar.file,
+          kind: exemplar.kind,
+          issues,
+          exemplarFile: exemplar.exemplarFile,
+          confidence: exemplar.confidence,
+        });
+      }
+    }
+
+    return gaps.slice(0, 12);
+  }
+
+  private unmatchedTaskTermsForSpec(taskProfile: TaskProfile): string[] {
+    const specContext = taskProfile.specContext;
+    if (!specContext) {
+      return [];
+    }
+
+    const specTerms = new Set([
+      ...(specContext.termIndex ?? specContext.terms ?? []),
+      ...specContext.referencedFiles.flatMap(file => this.extractTaskTerms(file)),
+    ].map(term => this.normalizeTaskTerm(term)));
+    const taskTerms = this.significantTaskTerms(taskProfile.terms)
+      .map(term => this.normalizeTaskTerm(term))
+      .filter(term => term.length >= 4)
+      .filter(term => !this.projectIdentityTerms().has(term))
+      .filter(term => !this.specTermsCoverTaskTerm(specTerms, term));
+
+    return Array.from(new Set(taskTerms)).slice(0, 8);
+  }
+
+  private projectIdentityTerms(): Set<string> {
+    return new Set(this.extractTaskTerms(basename(this.projectRoot)));
+  }
+
+  private specTermsCoverTaskTerm(specTerms: Set<string>, taskTerm: string): boolean {
+    if (specTerms.has(taskTerm)) {
+      return true;
+    }
+
+    for (const specTerm of specTerms) {
+      if (this.termsAreCloseEnough(specTerm, taskTerm)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  private termsAreCloseEnough(a: string, b: string): boolean {
+    const shorter = Math.min(a.length, b.length);
+    if (shorter < 6) {
+      return false;
+    }
+
+    let shared = 0;
+    while (shared < shorter && a[shared] === b[shared]) {
+      shared += 1;
+    }
+
+    return shared >= Math.min(7, shorter - 1);
+  }
+
+  private isHighFanoutFile(filePath: string): boolean {
+    const nodes = this.store.getNodesByFile(filePath);
+    let edgeCount = 0;
+    for (const node of nodes) {
+      edgeCount += this.store.getEdgesFrom(node.id).length + this.store.getEdgesTo(node.id).length;
+    }
+    return edgeCount >= 60;
+  }
+
+  private inferWorkingSetFocus(workingSet: ContextFile[]): 'frontend' | 'backend' | 'tests' | 'mixed' | 'unknown' {
+    const focuses = new Set<'frontend' | 'backend' | 'tests'>();
+    for (const file of workingSet.map(entry => entry.file)) {
+      if (file.startsWith('tests/')) {
+        focuses.add('tests');
+      } else if (this.isFrontendFile(file)) {
+        focuses.add('frontend');
+      } else if (
+        file.startsWith('app/')
+        || file.startsWith('routes/')
+        || file.startsWith('config/')
+        || file.startsWith('database/')
+      ) {
+        focuses.add('backend');
+      }
+    }
+
+    if (focuses.size === 0) return 'unknown';
+    if (focuses.size > 1) return 'mixed';
+    return Array.from(focuses)[0] ?? 'unknown';
+  }
+
   private isLowValuePrecedent(filePath: string, terms: string[]): boolean {
     const lower = filePath.toLowerCase();
     if (lower.includes('mock') && !terms.includes('mock')) return true;
     if (lower.includes('/scripts/api.') && !terms.some(term => ['api', 'network', 'request', 'http'].includes(term))) return true;
-    if (lower.includes('constant') && !terms.some(term => ['constant', 'combat', 'battle'].includes(term))) return true;
+    if (
+      lower.includes('constant')
+      && !terms.includes('constant')
+      && this.fileTermMatchScore(filePath, this.significantTaskTerms(terms)) <= 0
+    ) {
+      return true;
+    }
     return false;
   }
 
@@ -2032,11 +5392,11 @@ export class Weave {
   }
 
   private fileTermMatchScore(filePath: string, terms: string[]): number {
-    const lower = filePath.toLowerCase();
+    const tokens = this.searchTokensForText(filePath);
     let score = 0;
 
-    for (const term of terms) {
-      if (lower.includes(term)) {
+    for (const term of this.rankableTaskTerms(terms)) {
+      if (tokens.has(term)) {
         score += term.length >= 5 ? 10 : 7;
       }
     }
@@ -2165,7 +5525,7 @@ export class Weave {
       reasons: Map<string, ContextReason>;
       anchors: SubgraphNode[];
       score: number;
-      provenance: 'explicit_graph' | 'task_heuristic';
+      provenance: ContextProvenance;
     }>,
     taskProfile: TaskProfile,
     primaryStart: string | null,
@@ -2174,16 +5534,24 @@ export class Weave {
       return;
     }
 
-    const candidateFiles = [
-      'config/services.php',
-      'app/Providers/AppServiceProvider.php',
-    ];
-
-    const hasClientFocus = primaryStart?.startsWith('app/Clients/')
-      || Array.from(fileEntries.keys()).some(file => file.startsWith('app/Clients/'));
+    const hasClientFocus = primaryStart
+      ? this.isServiceClientPath(primaryStart.toLowerCase())
+      : Array.from(fileEntries.keys()).some(file => this.isServiceClientPath(file.toLowerCase()));
     if (!hasClientFocus) {
       return;
     }
+
+    const candidateFiles = this.indexedProjectFiles()
+      .filter(file =>
+        file.startsWith('config/')
+        || file.startsWith('app/Providers/')
+        || file.startsWith('src/Providers/'),
+      )
+      .sort((a, b) =>
+        this.infrastructureContextPriority(b) - this.infrastructureContextPriority(a)
+        || a.localeCompare(b),
+      )
+      .slice(0, 4);
 
     for (const file of candidateFiles) {
       const absolute = join(this.projectRoot, file);
@@ -2193,11 +5561,100 @@ export class Weave {
 
       const entry = this.getOrCreateFileEntry(fileEntries, file);
       entry.provenance = 'task_heuristic';
-      entry.score += file === 'config/services.php' ? 500 : 220;
+      entry.score += file.startsWith('config/') ? 500 : 220;
       entry.reasons.set('infrastructure wiring for client/service configuration', {
         text: 'infrastructure wiring for client/service configuration',
         provenance: 'task_heuristic',
         confidence: 0.72,
+      });
+    }
+  }
+
+  private infrastructureContextPriority(filePath: string): number {
+    const lower = filePath.toLowerCase();
+    if (lower === 'config/services.php') return 100;
+    if (lower.startsWith('config/') && this.pathHasCommunicationKeyword(lower)) return 90;
+    if (lower.startsWith('config/')) return 70;
+    if (lower.startsWith('app/providers/') || lower.startsWith('src/providers/')) return 60;
+    return 0;
+  }
+
+  private addEndpointLiteralContextFiles(
+    fileEntries: Map<string, {
+      file: string;
+      kinds: Set<string>;
+      reasons: Map<string, ContextReason>;
+      anchors: SubgraphNode[];
+      score: number;
+      provenance: ContextProvenance;
+    }>,
+    taskProfile: TaskProfile,
+  ): void {
+    const candidates = this.inferEndpointLiteralCandidates(taskProfile, 10);
+    for (const candidate of candidates) {
+      const entry = this.getOrCreateFileEntry(fileEntries, candidate.file);
+      if (entry.provenance !== 'explicit_graph') {
+        entry.provenance = 'task_heuristic';
+      }
+      entry.kinds.add(this.primaryKindForFile(candidate.file));
+      entry.score += candidate.file.startsWith('resources/js/composables/')
+        ? 150
+        : candidate.file.startsWith('resources/js/')
+          ? 120
+          : candidate.file.startsWith('routes/')
+            ? 110
+            : 70;
+
+      for (const reason of candidate.reasons) {
+        entry.reasons.set(reason, {
+          text: reason,
+          provenance: 'task_heuristic',
+          confidence: candidate.confidence,
+        });
+      }
+    }
+  }
+
+  private addSpecContextFiles(
+    fileEntries: Map<string, {
+      file: string;
+      kinds: Set<string>;
+      reasons: Map<string, ContextReason>;
+      anchors: SubgraphNode[];
+      score: number;
+      provenance: ContextProvenance;
+    }>,
+    taskProfile: TaskProfile,
+  ): void {
+    const specContext = taskProfile.specContext;
+    if (!specContext) {
+      return;
+    }
+
+    const specEntry = this.getOrCreateFileEntry(fileEntries, specContext.file);
+    if (specEntry.provenance !== 'explicit_graph') {
+      specEntry.provenance = 'spec_reference';
+    }
+    specEntry.kinds.add('spec');
+    specEntry.score += 180;
+    specEntry.reasons.set('provided spec document', {
+      text: 'provided spec document',
+      provenance: 'spec_reference',
+      confidence: 0.95,
+    });
+
+    for (const file of specContext.existingFiles) {
+      const entry = this.getOrCreateFileEntry(fileEntries, file);
+      if (entry.provenance !== 'explicit_graph') {
+        entry.provenance = 'spec_reference';
+      }
+      entry.kinds.add(this.primaryKindForFile(file));
+      entry.score += 1000;
+      const reason = `listed in spec ${specContext.file}`;
+      entry.reasons.set(reason, {
+        text: reason,
+        provenance: 'spec_reference',
+        confidence: 0.97,
       });
     }
   }
@@ -2209,7 +5666,7 @@ export class Weave {
       reasons: Map<string, ContextReason>;
       anchors: SubgraphNode[];
       score: number;
-      provenance: 'explicit_graph' | 'task_heuristic';
+      provenance: ContextProvenance;
     }>,
     taskProfile: TaskProfile,
     primaryStart: string | null,
@@ -2271,6 +5728,36 @@ export class Weave {
           provenance: 'task_heuristic',
           confidence: Math.max(0.76, candidate.confidence - 0.06),
         });
+
+        const nestedContent = this.readProjectTextFile(importedFile);
+        if (!nestedContent) {
+          continue;
+        }
+        const nestedImports = this.extractFrontendImportSources(nestedContent)
+          .map(source => this.resolveFrontendImport(importedFile, source))
+          .filter((file): file is string => file !== null);
+        for (const nestedImport of nestedImports) {
+          if (
+            this.isGeneratedPath(nestedImport)
+            || this.isLowValuePrecedent(nestedImport, taskProfile.terms)
+            || this.fileTermMatchScore(nestedImport, significantTerms) <= 0
+          ) {
+            continue;
+          }
+
+          const nestedEntry = this.getOrCreateFileEntry(fileEntries, nestedImport);
+          if (nestedEntry.provenance !== 'explicit_graph') {
+            nestedEntry.provenance = 'task_heuristic';
+          }
+          nestedEntry.kinds.add(this.primaryKindForFile(nestedImport));
+          nestedEntry.score += nestedImport.endsWith('.vue') ? 36 : 32;
+          const nestedReason = `imported by ${basename(importedFile)} and matches task terms`;
+          nestedEntry.reasons.set(nestedReason, {
+            text: nestedReason,
+            provenance: 'task_heuristic',
+            confidence: Math.max(0.7, candidate.confidence - 0.12),
+          });
+        }
       }
     }
   }

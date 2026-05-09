@@ -50,3 +50,6 @@ rules:
       - node:
           file: "{current_file}"
           kind: action
+          metadata:
+            framework: laravel-actions
+            trait: AsAction

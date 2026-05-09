@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { Weave } from '../src/weave.js';
@@ -13,6 +13,7 @@ function createFixtureProject(): string {
   mkdirSync(join(projectRoot, 'app/Actions/Admin'), { recursive: true });
   mkdirSync(join(projectRoot, 'resources/js/Pages/Auth'), { recursive: true });
   mkdirSync(join(projectRoot, 'resources/js/Pages/Admin/Hooks'), { recursive: true });
+  mkdirSync(join(projectRoot, 'resources/js/Pages'), { recursive: true });
   mkdirSync(join(projectRoot, 'routes'), { recursive: true });
   mkdirSync(join(projectRoot, 'tests/Feature/Admin'), { recursive: true });
 
@@ -65,11 +66,21 @@ class ShowLoginPageAction
   writeFileSync(
     join(projectRoot, 'resources/js/Pages/Auth/Login.vue'),
     `<script setup lang="ts">
+import Layout from '@/Pages/Layout.vue'
+
+defineOptions({ layout: Layout })
 defineProps<{ canResetPassword: boolean }>()
 </script>
 
 <template>
   <div>Login</div>
+</template>
+`,
+  );
+  writeFileSync(
+    join(projectRoot, 'resources/js/Pages/Layout.vue'),
+    `<template>
+  <main><slot /></main>
 </template>
 `,
   );
@@ -190,17 +201,403 @@ Route::get('/broken', MissingAction::class);
   return projectRoot;
 }
 
+function createLaravelKindProject(): string {
+  const projectRoot = mkdtempSync(join(tmpdir(), 'weave-laravel-kinds-'));
+
+  mkdirSync(join(projectRoot, 'app/Models'), { recursive: true });
+  mkdirSync(join(projectRoot, 'app/Services'), { recursive: true });
+  mkdirSync(join(projectRoot, 'app/Clients'), { recursive: true });
+  mkdirSync(join(projectRoot, 'app/Http/Requests'), { recursive: true });
+  mkdirSync(join(projectRoot, 'database/migrations'), { recursive: true });
+  mkdirSync(join(projectRoot, 'config/lore'), { recursive: true });
+
+  writeFileSync(join(projectRoot, 'artisan'), '#!/usr/bin/env php\n');
+  writeFileSync(
+    join(projectRoot, 'composer.json'),
+    JSON.stringify({
+      require: {
+        'laravel/framework': '^11.0',
+      },
+    }, null, 2),
+  );
+
+  writeFileSync(
+    join(projectRoot, 'app/Models/Post.php'),
+    `<?php
+
+namespace App\\Models;
+
+use Illuminate\\Database\\Eloquent\\Model;
+
+class Post extends Model
+{
+    protected $table = 'posts';
+}
+`,
+  );
+  writeFileSync(
+    join(projectRoot, 'app/Models/Comment.php'),
+    `<?php
+
+namespace App\\Models;
+
+use Illuminate\\Database\\Eloquent\\Model;
+
+class Comment extends Model
+{
+    protected $table = 'comments';
+}
+`,
+  );
+  writeFileSync(
+    join(projectRoot, 'app/Http/Requests/StorePostRequest.php'),
+    `<?php
+
+namespace App\\Http\\Requests;
+
+use Illuminate\\Foundation\\Http\\FormRequest;
+
+class StorePostRequest extends FormRequest
+{
+}
+`,
+  );
+  writeFileSync(
+    join(projectRoot, 'app/Http/Requests/UpdatePostRequest.php'),
+    `<?php
+
+namespace App\\Http\\Requests;
+
+use Illuminate\\Foundation\\Http\\FormRequest;
+
+class UpdatePostRequest extends FormRequest
+{
+}
+`,
+  );
+  writeFileSync(
+    join(projectRoot, 'app/Services/PostPublisher.php'),
+    `<?php
+
+namespace App\\Services;
+
+class PostPublisher
+{
+}
+`,
+  );
+  writeFileSync(
+    join(projectRoot, 'app/Services/PostDigestBuilder.php'),
+    `<?php
+
+namespace App\\Services;
+
+class PostDigestBuilder
+{
+}
+`,
+  );
+  writeFileSync(
+    join(projectRoot, 'app/Clients/PublishingApiClient.php'),
+    `<?php
+
+namespace App\\Clients;
+
+class PublishingApiClient
+{
+}
+`,
+  );
+  writeFileSync(
+    join(projectRoot, 'config/lore/index.php'),
+    `<?php
+
+return [
+    'entries' => [],
+];
+`,
+  );
+  writeFileSync(
+    join(projectRoot, 'config/lore/cosmology.php'),
+    `<?php
+
+return [
+    'category' => 'cosmology',
+];
+`,
+  );
+  writeFileSync(
+    join(projectRoot, 'database/migrations/2026_01_01_000000_create_posts_table.php'),
+    `<?php
+
+use Illuminate\\Database\\Migrations\\Migration;
+use Illuminate\\Database\\Schema\\Blueprint;
+use Illuminate\\Support\\Facades\\Schema;
+
+return new class extends Migration {
+    public function up(): void
+    {
+        Schema::create('posts', function (Blueprint $table) {
+            $table->id();
+        });
+    }
+};
+`,
+  );
+  writeFileSync(
+    join(projectRoot, 'database/migrations/2026_01_01_000001_create_comments_table.php'),
+    `<?php
+
+use Illuminate\\Database\\Migrations\\Migration;
+use Illuminate\\Database\\Schema\\Blueprint;
+use Illuminate\\Support\\Facades\\Schema;
+
+return new class extends Migration {
+    public function up(): void
+    {
+        Schema::create('comments', function (Blueprint $table) {
+            $table->id();
+        });
+    }
+};
+`,
+  );
+
+  return projectRoot;
+}
+
+function createSpecSeedProject(): string {
+  const projectRoot = mkdtempSync(join(tmpdir(), 'weave-spec-seed-'));
+  const statusFiller = Array.from({ length: 80 }, (_, index) =>
+    `    <p>Filler line ${index + 1}</p>`
+  ).join('\n');
+
+  mkdirSync(join(projectRoot, 'docs'), { recursive: true });
+  mkdirSync(join(projectRoot, 'resources/js/Pages/Orders'), { recursive: true });
+  mkdirSync(join(projectRoot, 'resources/js/Pages/Players'), { recursive: true });
+  mkdirSync(join(projectRoot, 'resources/js/Components/UI'), { recursive: true });
+  mkdirSync(join(projectRoot, 'resources/js/composables'), { recursive: true });
+  mkdirSync(join(projectRoot, 'app/Actions/Admin'), { recursive: true });
+  mkdirSync(join(projectRoot, 'app/Actions/Orders'), { recursive: true });
+  mkdirSync(join(projectRoot, 'app/Clients'), { recursive: true });
+  mkdirSync(join(projectRoot, 'routes'), { recursive: true });
+  mkdirSync(join(projectRoot, 'config'), { recursive: true });
+  mkdirSync(join(projectRoot, 'public'), { recursive: true });
+
+  writeFileSync(
+    join(projectRoot, 'composer.json'),
+    JSON.stringify({
+      require: {
+        'inertiajs/inertia-laravel': '^1.0',
+        'lorisleiva/laravel-actions': '^2.0',
+      },
+    }, null, 2),
+  );
+  writeFileSync(
+    join(projectRoot, 'package.json'),
+    JSON.stringify({
+      dependencies: {
+        vue: '^3.0.0',
+        '@inertiajs/vue3': '^1.0.0',
+      },
+    }, null, 2),
+  );
+  writeFileSync(
+    join(projectRoot, 'resources/js/Pages/Orders/Status.vue'),
+    `<template>
+  <section>
+    <h1>Status</h1>
+    <p id="lore-anchor">Lore copy insertion point</p>
+    <p>Order details continue here.</p>
+${statusFiller}
+  </section>
+</template>
+`,
+  );
+  writeFileSync(
+    join(projectRoot, 'resources/js/composables/useOrderEvents.js'),
+    `export function useOrderEvents() {
+  return {}
+}
+`,
+  );
+  writeFileSync(
+    join(projectRoot, 'resources/js/composables/usePerformanceTier.js'),
+    `export function usePerformanceTier() {
+  return {}
+}
+`,
+  );
+  writeFileSync(
+    join(projectRoot, 'resources/js/Pages/Players/Show.vue'),
+    `<template><div>Players</div></template>
+`,
+  );
+  writeFileSync(
+    join(projectRoot, 'resources/js/Components/UI/InfoTooltip.vue'),
+    `<template><span><slot /></span></template>
+`,
+  );
+  writeFileSync(
+    join(projectRoot, 'resources/js/Components/Alerts.vue'),
+    `<template><aside>Saved</aside></template>
+`,
+  );
+  writeFileSync(
+    join(projectRoot, 'routes/web.php'),
+    `<?php
+
+use Illuminate\\Support\\Facades\\Route;
+use App\\Actions\\Orders\\ShowOrderStatusAction;
+
+Route::get('/orders/{order}', ShowOrderStatusAction::class);
+`,
+  );
+  writeFileSync(
+    join(projectRoot, 'app/Actions/Orders/ShowOrderStatusAction.php'),
+    `<?php
+
+namespace App\\Actions\\Orders;
+
+use Inertia\\Inertia;
+use Lorisleiva\\Actions\\Concerns\\AsAction;
+
+class ShowOrderStatusAction
+{
+    use AsAction;
+
+    public function asController(): mixed
+    {
+        return Inertia::render('Orders/Status', [
+            'order' => ['id' => 1],
+        ]);
+    }
+}
+`,
+  );
+  writeFileSync(
+    join(projectRoot, 'app/Actions/Admin/ImpersonateUserAction.php'),
+    `<?php
+
+class ImpersonateUserAction
+{
+}
+`,
+  );
+  writeFileSync(
+    join(projectRoot, 'app/Clients/ExternalApiClient.php'),
+    `<?php
+
+namespace App\\Clients;
+
+class ExternalApiClient
+{
+}
+`,
+  );
+  writeFileSync(
+    join(projectRoot, 'config/app.php'),
+    `<?php
+
+return [
+    'name' => 'Fixture',
+];
+`,
+  );
+  writeFileSync(
+    join(projectRoot, 'public/index.php'),
+    `<?php
+`,
+  );
+  writeFileSync(
+    join(projectRoot, 'docs/LORE_FEATURE_DESIGN.md'),
+    `# Lore Feature Design
+
+| Type | Path |
+| --- | --- |
+| edit | \`resources/js/Pages/Orders/Status.vue:4-5\` |
+| edit | \`resources/js/composables/useOrderEvents.js\` |
+| edit | \`app/Actions/Orders/ShowOrderStatusAction.php\` |
+| add | \`app/Services/LoreRegistry.php\` |
+| add | \`app/Actions/Lore/DiscoverLoreAction.php\` |
+| add | \`database/migrations/2026_01_01_000000_create_discovered_lore_table.php\` |
+| edit | \`InfoTooltip.vue\` |
+| add | \`resources/js/Components/Lore/LoreText.vue\` |
+| add | \`LoreText.vue\` |
+| add | \`LoreTerm.vue\` |
+| add | \`Pages/Lore/Index.vue\` |
+| add | \`config/lore/the_unmaking.php\` |
+| edit | \`routes/web.php\` |
+| note | \`index.php\` |
+| content | \`the_unmaking.php\` |
+
+Laravel implementation uses \`LoreRegistry\` for discovery highlights and segment-aware typewriter text.
+## Typewriter Integration
+Implementation uses \`Three.js\` for the renderer.
+
+\`\`\`text
+config/lore/
+└── cosmology/
+    ├── the_unmaking.php
+    - the_veil.php
+    └── iron_concord.php
+\`\`\`
+`,
+  );
+
+  return projectRoot;
+}
+
+function createCrossLanguageCallProject(): string {
+  const projectRoot = mkdtempSync(join(tmpdir(), 'weave-cross-language-calls-'));
+
+  mkdirSync(join(projectRoot, 'resources/js/composables'), { recursive: true });
+  mkdirSync(join(projectRoot, 'config'), { recursive: true });
+  mkdirSync(join(projectRoot, 'routes'), { recursive: true });
+
+  writeFileSync(
+    join(projectRoot, 'package.json'),
+    JSON.stringify({ dependencies: { vue: '^3.0.0' } }, null, 2),
+  );
+  writeFileSync(
+    join(projectRoot, 'resources/js/composables/useSpellPreview.js'),
+    `const cache = new Map();
+
+export function useSpellPreview() {
+  if (cache.has('fireball')) {
+    console.warn('cached');
+  }
+  cache.set('fireball', true);
+}
+`,
+  );
+  writeFileSync(
+    join(projectRoot, 'config/cache.php'),
+    `<?php
+
+return [];
+`,
+  );
+  writeFileSync(
+    join(projectRoot, 'routes/console.php'),
+    `<?php
+`,
+  );
+
+  return projectRoot;
+}
+
 function createCommunicationAuditProject(): string {
   const projectRoot = mkdtempSync(join(tmpdir(), 'weave-communication-'));
 
   mkdirSync(join(projectRoot, 'app/Clients'), { recursive: true });
-  mkdirSync(join(projectRoot, 'app/Actions/Campaign/Turn'), { recursive: true });
-  mkdirSync(join(projectRoot, 'app/Actions/Campaign/Events'), { recursive: true });
-  mkdirSync(join(projectRoot, 'app/Actions/Campaign'), { recursive: true });
+  mkdirSync(join(projectRoot, 'app/Actions/Orders/Processing'), { recursive: true });
+  mkdirSync(join(projectRoot, 'app/Actions/Orders/Events'), { recursive: true });
+  mkdirSync(join(projectRoot, 'app/Actions/Orders'), { recursive: true });
   mkdirSync(join(projectRoot, 'app/Actions/Admin'), { recursive: true });
   mkdirSync(join(projectRoot, 'app/Providers'), { recursive: true });
   mkdirSync(join(projectRoot, 'config'), { recursive: true });
-  mkdirSync(join(projectRoot, 'resources/js/Pages/Campaign'), { recursive: true });
+  mkdirSync(join(projectRoot, 'resources/js/Pages/Orders'), { recursive: true });
   mkdirSync(join(projectRoot, 'resources/js/composables'), { recursive: true });
   mkdirSync(join(projectRoot, 'resources/js/Scripts'), { recursive: true });
   mkdirSync(join(projectRoot, 'routes'), { recursive: true });
@@ -228,14 +625,14 @@ function createCommunicationAuditProject(): string {
   );
 
   writeFileSync(
-    join(projectRoot, 'app/Clients/GameEngineClient.php'),
+    join(projectRoot, 'app/Clients/PaymentGatewayClient.php'),
     `<?php
 
 namespace App\\Clients;
 
-class GameEngineClient
+class PaymentGatewayClient
 {
-    public function submitTurn(array $payload): array
+    public function submitOrder(array $payload): array
     {
         return $payload;
     }
@@ -244,39 +641,39 @@ class GameEngineClient
   );
 
   writeFileSync(
-    join(projectRoot, 'app/Actions/Campaign/Turn/CreateCampaignTurnAction.php'),
+    join(projectRoot, 'app/Actions/Orders/Processing/CreateOrderProcessingAction.php'),
     `<?php
 
-namespace App\\Actions\\Campaign\\Turn;
+namespace App\\Actions\\Orders\\Processing;
 
-use App\\Clients\\GameEngineClient;
+use App\\Clients\\PaymentGatewayClient;
 use Lorisleiva\\Actions\\Concerns\\AsAction;
 
-class CreateCampaignTurnAction
+class CreateOrderProcessingAction
 {
     use AsAction;
 
-    public function __construct(private GameEngineClient $gameEngine)
+    public function __construct(private PaymentGatewayClient $payments)
     {
     }
 
     public function asController(): array
     {
-        return $this->gameEngine->submitTurn(['ok' => true]);
+        return $this->payments->submitOrder(['ok' => true]);
     }
 }
 `,
   );
 
   writeFileSync(
-    join(projectRoot, 'app/Actions/Campaign/Events/StreamEventsAction.php'),
+    join(projectRoot, 'app/Actions/Orders/Events/StreamOrderEventsAction.php'),
     `<?php
 
-namespace App\\Actions\\Campaign\\Events;
+namespace App\\Actions\\Orders\\Events;
 
 use Lorisleiva\\Actions\\Concerns\\AsAction;
 
-class StreamEventsAction
+class StreamOrderEventsAction
 {
     use AsAction;
 
@@ -289,14 +686,14 @@ class StreamEventsAction
   );
 
   writeFileSync(
-    join(projectRoot, 'app/Actions/Campaign/Turn/ListCampaignTurnsAction.php'),
+    join(projectRoot, 'app/Actions/Orders/Processing/ListOrderProcessingRunsAction.php'),
     `<?php
 
-namespace App\\Actions\\Campaign\\Turn;
+namespace App\\Actions\\Orders\\Processing;
 
 use Lorisleiva\\Actions\\Concerns\\AsAction;
 
-class ListCampaignTurnsAction
+class ListOrderProcessingRunsAction
 {
     use AsAction;
 
@@ -309,21 +706,21 @@ class ListCampaignTurnsAction
   );
 
   writeFileSync(
-    join(projectRoot, 'app/Actions/Campaign/ShowTurnsPageAction.php'),
+    join(projectRoot, 'app/Actions/Orders/ShowOrderStatusPageAction.php'),
     `<?php
 
-namespace App\\Actions\\Campaign;
+namespace App\\Actions\\Orders;
 
 use Inertia\\Inertia;
 use Lorisleiva\\Actions\\Concerns\\AsAction;
 
-class ShowTurnsPageAction
+class ShowOrderStatusPageAction
 {
     use AsAction;
 
     public function asController()
     {
-        return Inertia::render('Campaign/Turns');
+        return Inertia::render('Orders/Status');
     }
 }
 `,
@@ -335,14 +732,14 @@ class ShowTurnsPageAction
 
 namespace App\\Actions\\Admin;
 
-use App\\Clients\\GameEngineClient;
+use App\\Clients\\PaymentGatewayClient;
 use Lorisleiva\\Actions\\Concerns\\AsAction;
 
 class CreateHookAction
 {
     use AsAction;
 
-    public function asController(GameEngineClient $gameEngine): array
+    public function asController(PaymentGatewayClient $payments): array
     {
         return ['ok' => true];
     }
@@ -351,19 +748,19 @@ class CreateHookAction
   );
 
   writeFileSync(
-    join(projectRoot, 'app/Actions/Admin/ListCampaignEventsAction.php'),
+    join(projectRoot, 'app/Actions/Admin/ListOrderEventsAction.php'),
     `<?php
 
 namespace App\\Actions\\Admin;
 
-use App\\Clients\\GameEngineClient;
+use App\\Clients\\PaymentGatewayClient;
 use Lorisleiva\\Actions\\Concerns\\AsAction;
 
-class ListCampaignEventsAction
+class ListOrderEventsAction
 {
     use AsAction;
 
-    public function __construct(private GameEngineClient $client)
+    public function __construct(private PaymentGatewayClient $client)
     {
     }
 
@@ -381,14 +778,14 @@ class ListCampaignEventsAction
 
 namespace App\\Providers;
 
-use App\\Clients\\GameEngineClient;
+use App\\Clients\\PaymentGatewayClient;
 use Illuminate\\Support\\ServiceProvider;
 
 class AppServiceProvider extends ServiceProvider
 {
     public function register(): void
     {
-        $this->app->singleton(GameEngineClient::class, fn () => new GameEngineClient());
+        $this->app->singleton(PaymentGatewayClient::class, fn () => new PaymentGatewayClient());
     }
 }
 `,
@@ -399,9 +796,9 @@ class AppServiceProvider extends ServiceProvider
     `<?php
 
 return [
-    'game_engine' => [
-        'url' => env('GAME_ENGINE_URL'),
-        'secret' => env('GAME_ENGINE_SECRET'),
+    'payment_gateway' => [
+        'url' => env('PAYMENT_GATEWAY_URL'),
+        'secret' => env('PAYMENT_GATEWAY_SECRET'),
     ],
 ];
 `,
@@ -411,12 +808,12 @@ return [
     join(projectRoot, 'routes/api.php'),
     `<?php
 
-use App\\Actions\\Campaign\\Events\\StreamEventsAction;
-use App\\Actions\\Campaign\\Turn\\CreateCampaignTurnAction;
+use App\\Actions\\Orders\\Events\\StreamOrderEventsAction;
+use App\\Actions\\Orders\\Processing\\CreateOrderProcessingAction;
 use Illuminate\\Support\\Facades\\Route;
 
-Route::post('/campaigns/{campaign}/turns', CreateCampaignTurnAction::class);
-Route::get('/campaigns/{campaign}/events/stream', StreamEventsAction::class);
+Route::post('/orders/{order}/processing', CreateOrderProcessingAction::class);
+Route::get('/orders/{order}/events/stream', StreamOrderEventsAction::class);
 `,
   );
 
@@ -427,48 +824,48 @@ Route::get('/campaigns/{campaign}/events/stream', StreamEventsAction::class);
   );
 
   writeFileSync(
-    join(projectRoot, 'resources/js/composables/useCampaignEvents.js'),
-    `export function useCampaignEvents(campaignId) {
-  return { connect() { return campaignId; } };
+    join(projectRoot, 'resources/js/composables/useOrderEvents.js'),
+    `export function useOrderEvents(orderId) {
+  return { connect() { return orderId; } };
 }
 `,
   );
 
   writeFileSync(
-    join(projectRoot, 'resources/js/composables/useTurnResume.js'),
-    `export function useTurnResume(options) {
+    join(projectRoot, 'resources/js/composables/useOrderPolling.js'),
+    `export function useOrderPolling(options) {
   return { options };
 }
 `,
   );
 
   writeFileSync(
-    join(projectRoot, 'resources/js/composables/useEngineCombat.js'),
-    `export function useEngineCombat(options) {
+    join(projectRoot, 'resources/js/composables/usePaymentStatus.js'),
+    `export function usePaymentStatus(options) {
   return { options };
 }
 `,
   );
 
   writeFileSync(
-    join(projectRoot, 'resources/js/Pages/Campaign/Turns.vue'),
+    join(projectRoot, 'resources/js/Pages/Orders/Status.vue'),
     `<script setup>
 import { postWithKeepalive } from '@/Scripts/api.js';
-import { useCampaignEvents } from '@/composables/useCampaignEvents.js';
-import { useTurnResume } from '@/composables/useTurnResume.js';
-import { useEngineCombat } from '@/composables/useEngineCombat.js';
+import { useOrderEvents } from '@/composables/useOrderEvents.js';
+import { useOrderPolling } from '@/composables/useOrderPolling.js';
+import { usePaymentStatus } from '@/composables/usePaymentStatus.js';
 
-useCampaignEvents('1');
-useTurnResume({});
-useEngineCombat({});
+useOrderEvents('1');
+useOrderPolling({});
+usePaymentStatus({});
 
 async function submit() {
-  await postWithKeepalive('/api/campaigns/1/turns', {});
+  await postWithKeepalive('/api/orders/1/processing', {});
 }
 </script>
 
 <template>
-  <button @click="submit">Submit turn</button>
+  <button @click="submit">Submit order</button>
 </template>
 `,
   );
@@ -770,6 +1167,194 @@ test('debug panel dice roll smoke test', function () {
   return projectRoot;
 }
 
+function createFrontendEndpointProject(): string {
+  const projectRoot = mkdtempSync(join(tmpdir(), 'weave-frontend-endpoint-'));
+
+  mkdirSync(join(projectRoot, 'app/Actions/Orders/Fulfillment'), { recursive: true });
+  mkdirSync(join(projectRoot, 'app/Actions/Admin'), { recursive: true });
+  mkdirSync(join(projectRoot, 'resources/js/Pages/Orders'), { recursive: true });
+  mkdirSync(join(projectRoot, 'resources/js/composables'), { recursive: true });
+  mkdirSync(join(projectRoot, 'resources/js/Scripts'), { recursive: true });
+  mkdirSync(join(projectRoot, 'routes'), { recursive: true });
+  mkdirSync(join(projectRoot, 'tests/Feature'), { recursive: true });
+
+  writeFileSync(join(projectRoot, 'artisan'), '#!/usr/bin/env php\n');
+  writeFileSync(
+    join(projectRoot, 'composer.json'),
+    JSON.stringify({
+      require: {
+        'laravel/framework': '^11.0',
+        'lorisleiva/laravel-actions': '^2.0',
+      },
+    }, null, 2),
+  );
+  writeFileSync(
+    join(projectRoot, 'package.json'),
+    JSON.stringify({
+      dependencies: {
+        vue: '^3.0.0',
+      },
+    }, null, 2),
+  );
+
+  writeFileSync(
+    join(projectRoot, 'routes/api.php'),
+    `<?php
+
+use App\\Actions\\Orders\\Fulfillment\\FulfillmentAction;
+use App\\Actions\\Orders\\Fulfillment\\GetFulfillmentStateAction;
+use App\\Actions\\Orders\\Fulfillment\\PreviewFulfillmentAction;
+use Illuminate\\Support\\Facades\\Route;
+
+Route::post('/orders/{order}/fulfillment/action', FulfillmentAction::class);
+Route::get('/orders/{order}/fulfillment/state', GetFulfillmentStateAction::class);
+Route::get('/orders/{order}/fulfillment/preview', PreviewFulfillmentAction::class);
+`,
+  );
+
+  writeFileSync(
+    join(projectRoot, 'app/Actions/Orders/Fulfillment/FulfillmentAction.php'),
+    `<?php
+
+namespace App\\Actions\\Orders\\Fulfillment;
+
+use Lorisleiva\\Actions\\Concerns\\AsAction;
+
+class FulfillmentAction
+{
+    use AsAction;
+
+    public function asController(): array
+    {
+        return ['ok' => true];
+    }
+}
+`,
+  );
+
+  writeFileSync(
+    join(projectRoot, 'app/Actions/Orders/Fulfillment/GetFulfillmentStateAction.php'),
+    `<?php
+
+namespace App\\Actions\\Orders\\Fulfillment;
+
+use Lorisleiva\\Actions\\Concerns\\AsAction;
+
+class GetFulfillmentStateAction
+{
+    use AsAction;
+}
+`,
+  );
+
+  writeFileSync(
+    join(projectRoot, 'app/Actions/Orders/Fulfillment/PreviewFulfillmentAction.php'),
+    `<?php
+
+namespace App\\Actions\\Orders\\Fulfillment;
+
+use Lorisleiva\\Actions\\Concerns\\AsAction;
+
+class PreviewFulfillmentAction
+{
+    use AsAction;
+}
+`,
+  );
+
+  writeFileSync(
+    join(projectRoot, 'app/Actions/Admin/PreviewEmailAction.php'),
+    `<?php
+
+namespace App\\Actions\\Admin;
+
+use Lorisleiva\\Actions\\Concerns\\AsAction;
+
+class PreviewEmailAction
+{
+    use AsAction;
+}
+`,
+  );
+
+  writeFileSync(
+    join(projectRoot, 'app/Actions/Admin/ShowAdminOrdersPageAction.php'),
+    `<?php
+
+namespace App\\Actions\\Admin;
+
+use Lorisleiva\\Actions\\Concerns\\AsAction;
+
+class ShowAdminOrdersPageAction
+{
+    use AsAction;
+}
+`,
+  );
+
+  writeFileSync(
+    join(projectRoot, 'resources/js/Scripts/api.js'),
+    `export async function postWithKeepalive(url, data = {}) {
+  return { url, data }
+}
+`,
+  );
+
+  writeFileSync(
+    join(projectRoot, 'resources/js/composables/useFulfillmentApi.js'),
+    `import { postWithKeepalive } from '@/Scripts/api.js'
+
+const ACTION_PATHS = {
+  ship: 'ship',
+  cancel: 'cancel',
+  action: 'action',
+}
+
+export function useFulfillmentApi(orderId) {
+  const fulfillmentBasePath = () => \`/api/orders/\${orderId.value}/fulfillment\`
+
+  async function sendAction(actionType, payload) {
+    const path = ACTION_PATHS[actionType]
+    return postWithKeepalive(\`\${fulfillmentBasePath()}/\${path}\`, payload)
+  }
+
+  async function getFulfillmentState() {
+    return fetch(\`\${fulfillmentBasePath()}/state\`, { headers: { Accept: 'application/json' } })
+  }
+
+  return { sendAction, getFulfillmentState }
+}
+`,
+  );
+
+  writeFileSync(
+    join(projectRoot, 'resources/js/Pages/Orders/Show.vue'),
+    `<script setup>
+import { useFulfillmentApi } from '@/composables/useFulfillmentApi.js'
+
+const fulfillment = useFulfillmentApi()
+fulfillment.sendAction('ship', {})
+</script>
+
+<template>
+  <div>Order</div>
+</template>
+`,
+  );
+
+  writeFileSync(
+    join(projectRoot, 'tests/Feature/UpdateNotificationSettingsActionTest.php'),
+    `<?php
+
+test('notification settings smoke test', function () {
+    expect(true)->toBeTrue();
+});
+`,
+  );
+
+  return projectRoot;
+}
+
 const createdProjects: string[] = [];
 
 afterEach(() => {
@@ -819,6 +1404,43 @@ class SyncHooksCommand extends Command
     expect(callTargets).toContain('$service.updateHook');
   });
 
+  it('does not resolve JavaScript member calls to same-name PHP files', async () => {
+    const projectRoot = createCrossLanguageCallProject();
+    createdProjects.push(projectRoot);
+
+    const weave = new Weave(projectRoot);
+    try {
+      await weave.init();
+      const result = weave.query({
+        start: 'resources/js/composables/useSpellPreview.js',
+        depth: 2,
+      });
+      const nodeById = new Map(result.nodes.map(node => [node.id, node] as const));
+      const callTargets = result.edges
+        .filter(edge => edge.relationship === 'calls')
+        .map(edge => nodeById.get(edge.to)?.file)
+        .filter((file): file is string => Boolean(file));
+      const status = await weave.status();
+
+      expect(callTargets).not.toContain('config/cache.php');
+      expect(callTargets).not.toContain('routes/console.php');
+      expect(status.diagnostics.issues).not.toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          details: expect.objectContaining({
+            targetSymbol: 'cache.has',
+          }),
+        }),
+        expect.objectContaining({
+          details: expect.objectContaining({
+            targetSymbol: 'console.warn',
+          }),
+        }),
+      ]));
+    } finally {
+      weave.close();
+    }
+  });
+
   it('builds convention edges against relative file paths and selects the enclosing symbol', async () => {
     const projectRoot = createFixtureProject();
     createdProjects.push(projectRoot);
@@ -858,6 +1480,47 @@ class SyncHooksCommand extends Command
         relationship: 'renders',
         convention: 'inertia',
       }));
+      expect(weave.exemplar('page')).toEqual(expect.objectContaining({
+        file: expect.stringMatching(/^resources\/js\/Pages\/.+\.vue$/),
+      }));
+      expect(weave.exemplar('action', undefined, { routeMethod: 'GET' })).toEqual(expect.objectContaining({
+        file: expect.stringMatching(/^app\/Actions\/(?:Auth\/ShowLoginPageAction|Admin\/ShowHookCreatePageAction)\.php$/),
+      }));
+      const routeImpact = weave.impact('routes/web.php', { summary: true });
+      expect(routeImpact.nodes).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          file: 'app/Actions/Auth/ShowLoginPageAction.php',
+        }),
+      ]));
+      expect(routeImpact.edges.some(edge => edge.relationship === 'routes_to')).toBe(true);
+      const layoutImpact = weave.impact('resources/js/Pages/Layout.vue', { summary: true });
+      expect(layoutImpact.impact?.crossFileNodes).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          file: 'resources/js/Pages/Auth/Login.vue',
+        }),
+      ]));
+      const validation = weave.validateWithSummary([
+        'app/Actions/Auth/ShowLoginPageAction.php',
+      ]);
+      expect(validation.summary.message).toContain('all pass');
+      expect(validation.checks).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          file: 'app/Actions/Auth/ShowLoginPageAction.php',
+          kind: 'action',
+          status: 'pass',
+        }),
+      ]));
+      const plannedValidation = weave.validateWithSummary([
+        'app/Actions/Auth/ShowRegisterPageAction.php',
+      ]);
+      expect(plannedValidation.checks).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          file: 'app/Actions/Auth/ShowRegisterPageAction.php',
+          kind: 'action',
+          predictive: true,
+        }),
+      ]));
+      expect(plannedValidation.summary.message).toContain('pending graph-dependent');
     } finally {
       weave.close();
     }
@@ -879,6 +1542,554 @@ class SyncHooksCommand extends Command
 
       expect(result.nodes.some(node => node.symbol === 'ShowLoginPageAction::asController')).toBe(true);
       expect(result.edges.some(edge => edge.relationship === 'renders')).toBe(true);
+    } finally {
+      weave.close();
+    }
+  });
+
+  it('rebuilds during refresh when the stored indexer fingerprint is stale', async () => {
+    const projectRoot = createFixtureProject();
+    createdProjects.push(projectRoot);
+
+    const weave = new Weave(projectRoot);
+    try {
+      await weave.init();
+      const fingerprintPath = join(projectRoot, '.weave', 'index-fingerprint.json');
+      const initial = JSON.parse(readFileSync(fingerprintPath, 'utf-8')) as { hash: string };
+      writeFileSync(fingerprintPath, `${JSON.stringify({
+        version: 0,
+        hash: 'stale-indexer',
+        plugins: [],
+        generatedAt: '2000-01-01T00:00:00.000Z',
+      }, null, 2)}\n`);
+
+      const refresh = await weave.refresh();
+      const refreshed = JSON.parse(readFileSync(fingerprintPath, 'utf-8')) as { hash: string };
+
+      expect(refresh.initialized).toBe(true);
+      expect(refreshed.hash).toBe(initial.hash);
+    } finally {
+      weave.close();
+    }
+  });
+
+  it('indexes markdown specs and lets bootstrap seed context from referenced files', async () => {
+    const projectRoot = createSpecSeedProject();
+    createdProjects.push(projectRoot);
+
+    const weave = new Weave(projectRoot);
+    try {
+      await weave.init();
+
+      const specResult = weave.query({
+        start: 'docs/LORE_FEATURE_DESIGN.md',
+        depth: 0,
+      });
+      expect(specResult.nodes).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          file: 'docs/LORE_FEATURE_DESIGN.md',
+          kind: 'spec',
+        }),
+      ]));
+
+      const payload = weave.bootstrap({
+        task: 'Build the lore codex feature described in the design doc',
+        fromSpec: 'docs/LORE_FEATURE_DESIGN.md',
+        maxFiles: 6,
+        maxEntryCandidates: 5,
+      });
+      const verbosePayload = weave.bootstrap({
+        task: 'Build the lore codex feature described in the design doc',
+        fromSpec: 'docs/LORE_FEATURE_DESIGN.md',
+        compact: false,
+        maxFiles: 6,
+        maxEntryCandidates: 5,
+      });
+      expect(payload.context.exemplars).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          plannedFile: 'app/Actions/Lore/DiscoverLoreAction.php',
+          provenance: 'spec_planned_file',
+          file: expect.any(String),
+        }),
+      ]));
+      expect(Buffer.byteLength(JSON.stringify(payload))).toBeLessThan(Buffer.byteLength(JSON.stringify(verbosePayload)));
+
+      expect(payload.spec).toEqual(expect.objectContaining({
+        file: 'docs/LORE_FEATURE_DESIGN.md',
+        existingFiles: expect.arrayContaining([
+          'resources/js/Pages/Orders/Status.vue',
+          'resources/js/Components/UI/InfoTooltip.vue',
+          'resources/js/composables/useOrderEvents.js',
+          'routes/web.php',
+        ]),
+        suspiciousReferences: expect.arrayContaining([
+          'index.php',
+        ]),
+      }));
+      expect(payload.spec?.suspiciousReferences).not.toContain('the_unmaking.php');
+      expect(payload.spec?.existingFiles).not.toContain('public/index.php');
+      expect(payload.entryCandidates.map(candidate => candidate.file)).not.toContain('public/index.php');
+      expect(payload.spec).toEqual(expect.objectContaining({
+        missingFiles: expect.arrayContaining([
+          'app/Actions/Lore/DiscoverLoreAction.php',
+          'database/migrations/2026_01_01_000000_create_discovered_lore_table.php',
+          'resources/js/Pages/Lore/Index.vue',
+          'resources/js/Components/Lore/LoreText.vue',
+          'resources/js/Components/LoreTerm.vue',
+          'config/lore/the_unmaking.php',
+          'config/lore/cosmology/the_unmaking.php',
+          'config/lore/cosmology/the_veil.php',
+          'config/lore/cosmology/iron_concord.php',
+        ]),
+        likelyNewFiles: expect.arrayContaining([
+          'app/Actions/Lore/DiscoverLoreAction.php',
+          'database/migrations/2026_01_01_000000_create_discovered_lore_table.php',
+          'resources/js/Pages/Lore/Index.vue',
+          'resources/js/Components/Lore/LoreText.vue',
+          'resources/js/Components/LoreTerm.vue',
+          'config/lore/the_unmaking.php',
+          'config/lore/cosmology/the_unmaking.php',
+          'config/lore/cosmology/the_veil.php',
+          'config/lore/cosmology/iron_concord.php',
+        ]),
+        plannedFiles: expect.arrayContaining([
+          'app/Services/LoreRegistry.php',
+          'app/Actions/Lore/DiscoverLoreAction.php',
+          'resources/js/Pages/Lore/Index.vue',
+        ]),
+        existingTargets: expect.arrayContaining([
+          'resources/js/Pages/Orders/Status.vue',
+          'app/Actions/Orders/ShowOrderStatusAction.php',
+        ]),
+        staleSpecRefs: expect.arrayContaining([
+          'index.php',
+        ]),
+        novelPathPrefixes: expect.arrayContaining([
+          'resources/js/Pages/Lore',
+          'config/lore',
+        ]),
+      }));
+      expect(payload.spec?.referencedFiles).not.toContain('Three.js');
+      expect(payload.spec?.likelyNewFiles).not.toContain('resources/js/Components/LoreText.vue');
+      expect(payload.spec?.suspiciousReferences).not.toContain('the_veil.php');
+      expect(payload.entryCandidates.map(candidate => candidate.file)).toEqual(expect.arrayContaining([
+        'resources/js/Pages/Orders/Status.vue',
+        'resources/js/Components/UI/InfoTooltip.vue',
+        'resources/js/composables/useOrderEvents.js',
+      ]));
+      expect(payload.entryCandidates[0]).toEqual(expect.objectContaining({
+        file: 'resources/js/Pages/Orders/Status.vue',
+        confidence: 0.99,
+      }));
+      expect(payload.spec?.lineReferences).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          file: 'resources/js/Pages/Orders/Status.vue',
+          lineStart: 4,
+          lineEnd: 5,
+        }),
+      ]));
+      expect(payload.spec?.lineAnchoredQueries).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          file: 'resources/js/Pages/Orders/Status.vue',
+          query: 'resources/js/Pages/Orders/Status.vue:4-5',
+        }),
+      ]));
+      expect(payload.spec?.existingFileEdges).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          file: 'app/Actions/Orders/ShowOrderStatusAction.php',
+          edges: expect.arrayContaining([
+            expect.objectContaining({
+              direction: 'incoming',
+              relationship: 'routes_to',
+              sourceFile: 'routes/web.php',
+              metadata: expect.objectContaining({
+                path: '/orders/{order}',
+              }),
+            }),
+            expect.objectContaining({
+              direction: 'outgoing',
+              relationship: 'renders',
+              targetFile: 'resources/js/Pages/Orders/Status.vue',
+              metadata: expect.objectContaining({
+                props: expect.arrayContaining(['order']),
+              }),
+            }),
+          ]),
+        }),
+      ]));
+      expect(payload.spec?.likelyNewFileExemplars).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          file: 'app/Services/LoreRegistry.php',
+          kind: 'service',
+          exemplarFile: null,
+          confidence: 0.35,
+        }),
+        expect.objectContaining({
+          file: 'app/Actions/Lore/DiscoverLoreAction.php',
+          kind: 'action',
+        }),
+        expect.objectContaining({
+          file: 'config/lore/cosmology/the_unmaking.php',
+          kind: 'config_array',
+          exemplarFile: null,
+          confidence: 0.35,
+        }),
+      ]));
+      expect(payload.spec?.plannedFilePatterns).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          file: 'app/Services/LoreRegistry.php',
+          kind: 'service',
+          role: expect.objectContaining({
+            primary: 'registry',
+          }),
+          directExemplarFile: null,
+          status: expect.stringMatching(/^(adjacent_evidence|evidence_gap)$/),
+          configPatterns: expect.arrayContaining([
+            expect.objectContaining({
+              pattern: 'config_array_files',
+              files: expect.arrayContaining(['config/app.php']),
+            }),
+          ]),
+          notes: expect.arrayContaining([
+            expect.stringContaining('No role-compatible registry exemplar found'),
+          ]),
+        }),
+      ]));
+      expect(payload.context.workingSet.map(file => file.file)).toEqual(expect.arrayContaining([
+        'docs/LORE_FEATURE_DESIGN.md',
+        'resources/js/Pages/Orders/Status.vue',
+        'resources/js/Components/UI/InfoTooltip.vue',
+        'resources/js/composables/useOrderEvents.js',
+        'routes/web.php',
+      ]));
+      expect(payload.context.workingSet).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          file: 'resources/js/Pages/Orders/Status.vue',
+          kind: 'inertia_page',
+          kinds: expect.arrayContaining(['component', 'inertia_page']),
+        }),
+      ]));
+      expect(payload.context.constraints).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          kind: 'component',
+          plugin: 'vue-composition',
+        }),
+      ]));
+      expect(payload.context.workingSet.slice(0, 5).map(file => file.file)).toEqual(expect.arrayContaining([
+        'resources/js/Pages/Orders/Status.vue',
+        'resources/js/Components/UI/InfoTooltip.vue',
+        'resources/js/composables/useOrderEvents.js',
+      ]));
+      expect(weave.exemplar('component', undefined, { subKind: 'leaf' })).toEqual(expect.objectContaining({
+        file: 'resources/js/Components/Alerts.vue',
+      }));
+      expect(weave.conventions('component')).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          property: 'has <template> block',
+          confidence: 1,
+        }),
+      ]));
+      expect(weave.conventions('composable')).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          property: 'returns an object API',
+          confidence: 1,
+        }),
+      ]));
+      const lineRangeQuery = weave.query({
+        start: 'resources/js/Pages/Orders/Status.vue:4-5',
+        depth: 0,
+        options: { includeSnippets: true, maxTokens: 300 },
+      });
+      expect(lineRangeQuery.nodes).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          file: 'resources/js/Pages/Orders/Status.vue',
+          kind: 'vue_template',
+          snippetLines: expect.arrayContaining([expect.any(Number), expect.any(Number)]),
+          snippet: expect.stringContaining('lore-anchor'),
+        }),
+      ]));
+      const defaultLineRangeQuery = weave.query({
+        start: 'resources/js/Pages/Orders/Status.vue:4-5',
+        options: { includeSnippets: true, maxTokens: 3000 },
+      });
+      expect(defaultLineRangeQuery.nodes.length).toBeLessThanOrEqual(2);
+      expect(defaultLineRangeQuery.edges).toEqual([]);
+      expect(defaultLineRangeQuery.budget?.omittedEdges).toBe(0);
+      expect(defaultLineRangeQuery.nodes).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          file: 'resources/js/Pages/Orders/Status.vue',
+          kind: 'vue_template',
+          lines: [1, 87],
+          snippetLines: [1, 35],
+          snippet: expect.stringContaining('lore-anchor'),
+        }),
+      ]));
+      expect(defaultLineRangeQuery.nodes.some(node => node.kind === 'component')).toBe(false);
+      const lineRangeImpact = weave.impact('resources/js/Pages/Orders/Status.vue', {
+        lineStart: 4,
+        lineEnd: 5,
+        summary: true,
+        maxTokens: 300,
+      });
+      expect(lineRangeImpact.nodes).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          file: 'resources/js/Pages/Orders/Status.vue',
+          kind: 'vue_template',
+        }),
+      ]));
+      expect(lineRangeImpact.nodes.some(node => node.kind === 'component')).toBe(true);
+      expect(lineRangeImpact.impact?.targetFiles).toContain('resources/js/Pages/Orders/Status.vue');
+      expect(payload.workingSet).toBe(payload.context.workingSet);
+      expect(payload.constraints).toBe(payload.context.constraints);
+      expect(payload.exemplars).toBe(payload.context.exemplars);
+      expect(payload.warnings).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          code: 'novel_path_prefixes',
+          files: expect.arrayContaining(['config/lore']),
+        }),
+        expect.objectContaining({
+          code: 'planned_file_evidence_gaps',
+          details: expect.objectContaining({
+            gaps: expect.arrayContaining([
+              expect.objectContaining({
+                file: 'app/Services/LoreRegistry.php',
+                issues: expect.arrayContaining([
+                  'no indexed exemplar',
+                ]),
+              }),
+              expect.objectContaining({
+                file: 'database/migrations/2026_01_01_000000_create_discovered_lore_table.php',
+                issues: expect.arrayContaining([
+                  'no indexed exemplar',
+                ]),
+              }),
+              expect.objectContaining({
+                file: 'config/lore/the_unmaking.php',
+                issues: expect.arrayContaining([
+                  'no indexed exemplar',
+                ]),
+              }),
+            ]),
+          }),
+        }),
+      ]));
+      expect(payload.context.workingSet.every(file => file.reasons.length > 0)).toBe(true);
+      expect(payload.context.workingSet.find(file =>
+        file.file === 'routes/web.php'
+      )).toEqual(expect.objectContaining({
+        confidence: expect.any(Number),
+      }));
+      expect(payload.context.workingSet.find(file =>
+        file.file === 'routes/web.php'
+      )?.confidence ?? 0).toBeGreaterThanOrEqual(0.9);
+
+      const compactPayload = weave.bootstrap({
+        task: 'Build lore discovery highlights from the design spec',
+        fromSpec: 'docs/LORE_FEATURE_DESIGN.md',
+        compact: true,
+        maxFiles: 6,
+        maxEntryCandidates: 5,
+        maxExemplars: 5,
+      });
+      expect(compactPayload.context.exemplars.length).toBeGreaterThan(0);
+      expect(compactPayload.context.exemplars.length).toBeLessThanOrEqual(5);
+      expect(compactPayload.context.exemplars).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          provenance: 'spec_planned_file',
+          plannedFile: expect.any(String),
+        }),
+      ]));
+      expect(compactPayload.spec?.likelyNewFileExemplars?.length).toBeGreaterThanOrEqual(5);
+      expect(compactPayload.spec?.likelyNewFileExemplars).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          file: 'app/Services/LoreRegistry.php',
+          exemplarFile: null,
+        }),
+      ]));
+      expect(compactPayload.spec?.existingFiles.length).toBeLessThanOrEqual(6);
+      expect(compactPayload.prompt).toContain('Generic context exemplars omitted from this prompt');
+      expect(compactPayload.context.workingSet.every(file =>
+        file.reasons.length <= 3 && file.anchors.length <= 2
+      )).toBe(true);
+
+      expect(payload.spec?.likelyNewFileExemplars).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          file: 'resources/js/Components/Lore/LoreText.vue',
+          exemplarFile: 'resources/js/Components/UI/InfoTooltip.vue',
+          reason: expect.stringContaining('co-mentioned'),
+        }),
+        expect.objectContaining({
+          file: 'app/Actions/Lore/DiscoverLoreAction.php',
+          kind: 'action',
+        }),
+      ]));
+
+      const missingQuery = weave.query({
+        start: 'config/lore/index.php',
+      });
+      expect(missingQuery).toEqual(expect.objectContaining({
+        nodes: [],
+        edges: [],
+        resolution: expect.objectContaining({
+          file: 'config/lore/index.php',
+          status: 'missing_file',
+        }),
+      }));
+
+      const autoSpecPayload = weave.bootstrap({
+        task: 'Implement the feature in docs/LORE_FEATURE_DESIGN.md',
+        maxFiles: 6,
+        maxEntryCandidates: 5,
+      });
+      expect(autoSpecPayload.spec?.file).toBe('docs/LORE_FEATURE_DESIGN.md');
+      expect(autoSpecPayload.entryCandidates.map(candidate => candidate.file)).toEqual(expect.arrayContaining([
+        'resources/js/Pages/Orders/Status.vue',
+        'resources/js/composables/useOrderEvents.js',
+      ]));
+
+      const specAwareQuery = weave.query({
+        start: 'resources/js/composables/useOrderEvents.js',
+        fromSpec: 'docs/LORE_FEATURE_DESIGN.md',
+        task: 'Implement the lore feature from the spec',
+      });
+      expect(specAwareQuery.specContext).toEqual(expect.objectContaining({
+        file: 'docs/LORE_FEATURE_DESIGN.md',
+        mode: 'summary',
+        relatedExistingFiles: expect.arrayContaining([
+          'resources/js/Pages/Orders/Status.vue',
+          'resources/js/composables/useOrderEvents.js',
+        ]),
+        plannedFiles: expect.arrayContaining([
+          'resources/js/Pages/Lore/Index.vue',
+        ]),
+        likelyNewFileExemplars: [],
+        plannedFileExemplarRefs: expect.arrayContaining([
+          expect.objectContaining({
+            file: 'resources/js/Pages/Lore/Index.vue',
+            exemplarFile: expect.any(String),
+          }),
+        ]),
+        plannedFilePatternRefs: expect.any(Array),
+      }));
+
+      const alignedPayload = weave.bootstrap({
+        task: 'Build Laravel LoreRegistry discovery highlights segment-aware typewriter',
+        fromSpec: 'docs/LORE_FEATURE_DESIGN.md',
+        maxFiles: 4,
+      });
+      expect(alignedPayload.warnings?.some(warning =>
+        warning.code === 'spec_task_term_mismatch'
+      )).toBe(false);
+      const integrationPayload = weave.bootstrap({
+        task: 'Integrate lore highlights into the typewriter',
+        fromSpec: 'docs/LORE_FEATURE_DESIGN.md',
+        maxFiles: 4,
+      });
+      expect(integrationPayload.warnings?.some(warning =>
+        warning.code === 'spec_task_term_mismatch'
+      )).toBe(false);
+
+      const noSpecPayload = weave.bootstrap({
+        task: 'Build per-player controls for the players page',
+        maxEntryCandidates: 5,
+        maxFiles: 4,
+      });
+      expect(noSpecPayload.entryCandidates.map(candidate => candidate.file)).toContain('resources/js/Pages/Players/Show.vue');
+      expect(noSpecPayload.entryCandidates.map(candidate => candidate.file)).not.toContain('resources/js/composables/usePerformanceTier.js');
+      expect(noSpecPayload.entryCandidates.map(candidate => candidate.file)).not.toContain('app/Actions/Admin/ImpersonateUserAction.php');
+
+      const mismatchedPayload = weave.bootstrap({
+        task: 'Build lore CRUD with tags, search, and visibility filters',
+        fromSpec: 'docs/LORE_FEATURE_DESIGN.md',
+        maxFiles: 4,
+      });
+      expect(mismatchedPayload.warnings).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          code: 'spec_task_term_mismatch',
+          terms: expect.arrayContaining(['crud', 'tags', 'search']),
+        }),
+      ]));
+
+      const inlinePayload = weave.bootstrap({
+        task: 'Build the inline lore UI notes',
+        fromSpecText: `# Inline Lore Notes
+
+Use \`InfoTooltip.vue\` and add \`Pages/Lore/Index.vue\`.
+`,
+        maxFiles: 3,
+      });
+      expect(inlinePayload.spec).toEqual(expect.objectContaining({
+        file: '<inline-spec>',
+        existingFiles: expect.arrayContaining([
+          'resources/js/Components/UI/InfoTooltip.vue',
+        ]),
+        likelyNewFiles: expect.arrayContaining([
+          'resources/js/Pages/Lore/Index.vue',
+        ]),
+      }));
+    } finally {
+      weave.close();
+    }
+  });
+
+  it('indexes Laravel model, migration, FormRequest, service, and config kinds for conventions and exemplars', async () => {
+    const projectRoot = createLaravelKindProject();
+    createdProjects.push(projectRoot);
+
+    const weave = new Weave(projectRoot);
+    try {
+      await weave.init();
+
+      expect(weave.query({ start: 'app/Models/Post.php', depth: 0 }).nodes).toEqual(expect.arrayContaining([
+        expect.objectContaining({ kind: 'model', symbol: 'Post' }),
+      ]));
+      expect(weave.query({ start: 'database/migrations/2026_01_01_000000_create_posts_table.php', depth: 0 }).nodes).toEqual(expect.arrayContaining([
+        expect.objectContaining({ kind: 'migration' }),
+      ]));
+      expect(weave.query({ start: 'app/Http/Requests/StorePostRequest.php', depth: 0 }).nodes).toEqual(expect.arrayContaining([
+        expect.objectContaining({ kind: 'form_request', symbol: 'StorePostRequest' }),
+      ]));
+      expect(weave.query({ start: 'app/Services/PostPublisher.php', depth: 0 }).nodes).toEqual(expect.arrayContaining([
+        expect.objectContaining({ kind: 'service', symbol: 'PostPublisher' }),
+      ]));
+      expect(weave.query({ start: 'app/Clients/PublishingApiClient.php', depth: 0 }).nodes).toEqual(expect.arrayContaining([
+        expect.objectContaining({ kind: 'service', symbol: 'PublishingApiClient' }),
+      ]));
+      expect(weave.query({ start: 'config/lore/index.php', depth: 0 }).nodes).toEqual(expect.arrayContaining([
+        expect.objectContaining({ kind: 'config_array', symbol: 'index' }),
+      ]));
+
+      expect(weave.exemplar('model')).toEqual(expect.objectContaining({
+        file: expect.stringMatching(/^app\/Models\/(?:Post|Comment)\.php$/),
+      }));
+      expect(weave.exemplar('migration')).toEqual(expect.objectContaining({
+        file: expect.stringMatching(/^database\/migrations\/2026_01_01_00000[01]_create_(?:posts|comments)_table\.php$/),
+      }));
+      expect(weave.exemplar('service')).toEqual(expect.objectContaining({
+        file: expect.stringMatching(/^app\/(?:Services\/(?:PostPublisher|PostDigestBuilder)|Clients\/PublishingApiClient)\.php$/),
+      }));
+      expect(weave.exemplar('config_array')).toEqual(expect.objectContaining({
+        file: expect.stringMatching(/^config\/lore\/(?:index|cosmology)\.php$/),
+      }));
+      expect(weave.conventions('request').map(convention => convention.kind)).toEqual(expect.arrayContaining([
+        'form_request',
+      ]));
+
+      const serviceSpecPayload = weave.bootstrap({
+        task: 'Add a report digest builder service',
+        fromSpecText: 'Create `app/Services/ReportDigestBuilder.php`.',
+        maxFiles: 3,
+      });
+      expect(serviceSpecPayload.spec?.plannedFilePatterns).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          file: 'app/Services/ReportDigestBuilder.php',
+          role: expect.objectContaining({
+            primary: 'builder',
+          }),
+          status: 'direct_exemplar',
+          directExemplarFile: 'app/Services/PostDigestBuilder.php',
+        }),
+      ]));
     } finally {
       weave.close();
     }
@@ -1063,6 +2274,32 @@ class SyncHooksCommand extends Command
     }
   });
 
+  it('marks greenfield bootstrap candidates as weak fallback when dominant task terms have no graph evidence', async () => {
+    const projectRoot = createFixtureProject();
+    createdProjects.push(projectRoot);
+
+    const weave = new Weave(projectRoot);
+    try {
+      await weave.init();
+
+      const payload = weave.bootstrap({
+        task: 'Build a lore codex archive for player discoveries',
+        maxFiles: 4,
+      });
+
+      expect(payload.entryCandidates.length).toBeGreaterThan(0);
+      expect(payload.entryCandidates.every(candidate => candidate.confidence <= 0.35)).toBe(true);
+      expect(payload.entryCandidates.every(candidate =>
+        candidate.reasons.includes('weak fallback: no strong graph evidence for dominant task terms')
+      )).toBe(true);
+      expect(payload.guidance).toEqual(expect.arrayContaining([
+        expect.stringContaining('No strong graph evidence matched the dominant task terms'),
+      ]));
+    } finally {
+      weave.close();
+    }
+  });
+
   it('defaults inferred bootstrap to implementation files for UI tasks', async () => {
     const projectRoot = createFixtureProject();
     createdProjects.push(projectRoot);
@@ -1102,8 +2339,8 @@ class SyncHooksCommand extends Command
       await weave.init();
 
       const payload = weave.bootstrap({
-        task: 'Audit the communication architecture around game engine turn processing, realtime events, polling, and keepalive behavior',
-        start: 'app/Clients/GameEngineClient.php',
+        task: 'Audit the communication architecture around payment service order processing, realtime events, polling, and keepalive behavior',
+        start: 'app/Clients/PaymentGatewayClient.php',
         depth: 2,
         maxFiles: 12,
         maxConstraints: 6,
@@ -1112,31 +2349,55 @@ class SyncHooksCommand extends Command
 
       expect(payload.taskMode).toBe('audit_communication');
       expect(payload.entryCandidates.map(candidate => candidate.file)).toEqual(expect.arrayContaining([
-        'app/Clients/GameEngineClient.php',
-        'app/Actions/Campaign/Turn/CreateCampaignTurnAction.php',
-        'app/Actions/Campaign/Events/StreamEventsAction.php',
-        'resources/js/Pages/Campaign/Turns.vue',
+        'app/Clients/PaymentGatewayClient.php',
+        'app/Actions/Orders/Processing/CreateOrderProcessingAction.php',
+        'app/Actions/Orders/Events/StreamOrderEventsAction.php',
+        'resources/js/Pages/Orders/Status.vue',
       ]));
-      expect(payload.entryCandidates.some(candidate => candidate.file === 'app/Actions/Admin/ListCampaignEventsAction.php')).toBe(false);
-      expect(payload.entryCandidates.some(candidate => candidate.file === 'app/Actions/Campaign/Turn/ListCampaignTurnsAction.php')).toBe(false);
+      expect(payload.entryCandidates.some(candidate => candidate.file === 'app/Actions/Admin/ListOrderEventsAction.php')).toBe(false);
+      expect(payload.entryCandidates.some(candidate => candidate.file === 'app/Actions/Orders/Processing/ListOrderProcessingRunsAction.php')).toBe(false);
 
       const workingFiles = payload.context.workingSet.map(file => file.file);
       expect(workingFiles).toEqual(expect.arrayContaining([
-        'app/Actions/Campaign/Turn/CreateCampaignTurnAction.php',
-        'app/Actions/Campaign/Events/StreamEventsAction.php',
-        'resources/js/Pages/Campaign/Turns.vue',
-        'resources/js/composables/useCampaignEvents.js',
-        'resources/js/composables/useTurnResume.js',
-        'resources/js/composables/useEngineCombat.js',
+        'app/Actions/Orders/Processing/CreateOrderProcessingAction.php',
+        'app/Actions/Orders/Events/StreamOrderEventsAction.php',
+        'resources/js/Pages/Orders/Status.vue',
+        'resources/js/composables/useOrderEvents.js',
+        'resources/js/composables/useOrderPolling.js',
+        'resources/js/composables/usePaymentStatus.js',
         'resources/js/Scripts/api.js',
         'config/services.php',
       ]));
       expect(workingFiles.some(file => file.startsWith('tests/'))).toBe(false);
-      expect(workingFiles).not.toContain('app/Actions/Admin/ListCampaignEventsAction.php');
-      expect(workingFiles).not.toContain('app/Actions/Campaign/Turn/ListCampaignTurnsAction.php');
+      expect(workingFiles).not.toContain('app/Actions/Admin/ListOrderEventsAction.php');
+      expect(workingFiles).not.toContain('app/Actions/Orders/Processing/ListOrderProcessingRunsAction.php');
       expect(payload.context.workingSet.some(file =>
-        file.file === 'config/services.php' && file.provenance === 'task_heuristic'
+        file.file === 'config/services.php'
       )).toBe(true);
+      expect(weave.conventions('composable')).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          kind: 'composable',
+          property: 'matches naming pattern use{Name}',
+          confidence: 1,
+        }),
+        expect.objectContaining({
+          kind: 'composable',
+          property: 'located in resources/js/composables/',
+          confidence: 1,
+        }),
+      ]));
+
+      const validation = weave.validateWithSummary([
+        'resources/js/composables/useOrderEvents.js',
+      ]);
+      expect(validation.checks).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          file: 'resources/js/composables/useOrderEvents.js',
+          kind: 'composable',
+          rule: 'matches naming pattern use{Name}',
+          status: 'pass',
+        }),
+      ]));
     } finally {
       weave.close();
     }
@@ -1190,6 +2451,12 @@ class SyncHooksCommand extends Command
         'resources/js/composables/useWeatherIntensity.js',
         'app/Http/Middleware/HandleInertiaRequests.php',
       ])).toEqual([]);
+      const validation = weave.validateWithSummary([
+        'resources/js/composables/useWeatherIntensity.js',
+        'app/Http/Middleware/HandleInertiaRequests.php',
+      ]);
+      expect(validation.summary.message).toContain('all pass');
+      expect(validation.checks.every(check => check.status === 'pass')).toBe(true);
     } finally {
       weave.close();
     }
@@ -1255,6 +2522,67 @@ class SyncHooksCommand extends Command
         'resources/js/utils/diceNotation.js',
       ]));
       expect(workingFiles).not.toContain('resources/js/composables/useMockCombat.js');
+      expect(workingFiles.some(file => file.startsWith('tests/'))).toBe(false);
+
+      const impact = weave.impact('resources/js/Components/Game/DebugPanel.vue');
+      expect(impact.impact).toEqual(expect.objectContaining({
+        targetFiles: ['resources/js/Components/Game/DebugPanel.vue'],
+        counts: expect.objectContaining({
+          crossFileNodes: expect.any(Number),
+          crossFileEdges: expect.any(Number),
+          intraFileEdges: expect.any(Number),
+        }),
+      }));
+      expect(impact.impact?.crossFileNodes.some(node =>
+        node.file === 'resources/js/Pages/Campaign/Turns.vue'
+      )).toBe(true);
+      const summarizedImpact = weave.impact('resources/js/Components/Game/DebugPanel.vue', {
+        summary: true,
+        maxTokens: 600,
+      });
+      expect(summarizedImpact.impact?.budget).toEqual(expect.objectContaining({
+        summary: true,
+        maxTokens: 600,
+      }));
+      const kindBreakdown = Object.values(summarizedImpact.impact?.kindBreakdown ?? {});
+      expect(kindBreakdown.some((entry) =>
+        typeof entry.shown === 'number' && typeof entry.total === 'number',
+      )).toBe(true);
+      expect(summarizedImpact.edges.length).toBeLessThanOrEqual(summarizedImpact.impact?.budget?.maxEdges ?? 0);
+    } finally {
+      weave.close();
+    }
+  });
+
+  it('uses endpoint literals to surface frontend HTTP callers instead of generic action-path noise', async () => {
+    const projectRoot = createFrontendEndpointProject();
+    createdProjects.push(projectRoot);
+
+    const weave = new Weave(projectRoot);
+    try {
+      await weave.init();
+
+      const payload = weave.bootstrap({
+        task: 'Fix the frontend dispatcher for /fulfillment/ship, /fulfillment/cancel, and /fulfillment/action endpoint behavior',
+        maxFiles: 8,
+        maxExemplars: 3,
+      });
+
+      expect(payload.scopeMismatch).toBeNull();
+      expect(payload.entryCandidates[0]?.file).toBe('resources/js/composables/useFulfillmentApi.js');
+      expect(payload.entryCandidates.map(candidate => candidate.file)).toContain('resources/js/composables/useFulfillmentApi.js');
+      expect(payload.entryCandidates.map(candidate => candidate.file)).not.toContain('app/Actions/Admin/PreviewEmailAction.php');
+      expect(payload.entryCandidates.map(candidate => candidate.file)).not.toContain('app/Actions/Admin/ShowAdminOrdersPageAction.php');
+      expect(payload.entryCandidates.some(candidate => candidate.file.startsWith('tests/'))).toBe(false);
+
+      const workingFiles = payload.context.workingSet.map(file => file.file);
+      expect(workingFiles).toEqual(expect.arrayContaining([
+        'resources/js/composables/useFulfillmentApi.js',
+        'resources/js/Scripts/api.js',
+        'routes/api.php',
+      ]));
+      expect(workingFiles).not.toContain('app/Actions/Admin/PreviewEmailAction.php');
+      expect(workingFiles).not.toContain('app/Actions/Admin/ShowAdminOrdersPageAction.php');
       expect(workingFiles.some(file => file.startsWith('tests/'))).toBe(false);
     } finally {
       weave.close();
@@ -1324,6 +2652,22 @@ class SyncHooksCommand extends Command
           file: 'routes/web.php',
           layer: 3,
           plugin: 'laravel-actions',
+        }),
+      ]));
+
+      const bootstrap = weave.bootstrap({
+        task: 'Fix broken route wiring',
+        start: 'resources/js/app.ts',
+        maxFiles: 4,
+      });
+      expect(bootstrap.warnings).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          code: 'indexing_diagnostics_issues',
+          details: expect.objectContaining({
+            issueCount: expect.any(Number),
+            l2EdgesSkipped: expect.any(Number),
+            l3EdgesSkipped: expect.any(Number),
+          }),
         }),
       ]));
     } finally {

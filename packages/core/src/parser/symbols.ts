@@ -33,6 +33,9 @@ export class SymbolExtractor {
     if (language === 'vue') {
       return this.extractVue(filePath);
     }
+    if (language === 'markdown') {
+      return this.extractMarkdown(filePath);
+    }
 
     const tree = this.parser.parse(filePath);
 
@@ -48,6 +51,47 @@ export class SymbolExtractor {
       default:
         return { nodes: [], edges: [] };
     }
+  }
+
+  private extractMarkdown(filePath: string): ExtractionResult {
+    const source = this.parser.readSource(filePath);
+    const lines = source.split('\n');
+    const referencedFiles = this.extractMarkdownFileReferences(source);
+    const title = lines
+      .map(line => line.match(/^#\s+(.+)$/)?.[1]?.trim())
+      .find((value): value is string => Boolean(value))
+      ?? basename(filePath);
+
+    return {
+      nodes: [{
+        filePath,
+        symbolName: title,
+        kind: 'spec',
+        language: 'markdown',
+        lineStart: 1,
+        lineEnd: Math.max(1, lines.length),
+        signature: title,
+        metadata: {
+          referencedFiles,
+        },
+      }],
+      edges: [],
+    };
+  }
+
+  private extractMarkdownFileReferences(source: string): string[] {
+    const references = new Set<string>();
+    const pathPattern = /(^|[`\s|])([A-Za-z0-9_./@-]+\.(?:php|vue|js|ts|tsx|jsx|py|md|css|scss|json|yaml|yml|sql))(?::\d+(?:-\d+)?)?(?=$|[`\s|])/gm;
+
+    for (const match of source.matchAll(pathPattern)) {
+      const value = match[2]?.trim();
+      if (!value || value.startsWith('http')) {
+        continue;
+      }
+      references.add(value.replace(/^\.\/+/, '').replace(/:\d+(?:-\d+)?$/, ''));
+    }
+
+    return Array.from(references);
   }
 
   // ---------------------------------------------------------------------------
@@ -296,7 +340,37 @@ export class SymbolExtractor {
       }
     }
 
+    this.ensureComposableFileNode(filePath, source, lang, nodes);
+
     return { nodes, edges };
+  }
+
+  private ensureComposableFileNode(
+    filePath: string,
+    source: string,
+    language: string,
+    nodes: Partial<WeaveNode>[],
+  ): void {
+    const normalizedPath = filePath.replace(/\\/g, '/');
+    const symbolName = basename(filePath, extname(filePath));
+    if (!normalizedPath.includes('/composables/') || !symbolName.match(/^use[A-Z]/)) {
+      return;
+    }
+
+    if (nodes.some(node => node.kind === 'composable' && node.symbolName === symbolName)) {
+      return;
+    }
+
+    nodes.push({
+      filePath,
+      symbolName,
+      kind: 'composable',
+      language,
+      lineStart: 1,
+      lineEnd: Math.max(1, source.split('\n').length),
+      signature: null,
+      metadata: { fileLevel: true },
+    });
   }
 
   private extractTsFunction(
@@ -319,7 +393,7 @@ export class SymbolExtractor {
       lineStart: node.startPosition.row + 1,
       lineEnd: node.endPosition.row + 1,
       signature: this.extractSignatureLine(source, node),
-      metadata: null,
+      metadata: kind === 'composable' ? this.extractComposableMetadata(node) : null,
     });
 
     this.extractCallEdges(filePath, nameNode.text, node, edges);
@@ -576,7 +650,7 @@ export class SymbolExtractor {
         lineStart: node.startPosition.row + 1,
         lineEnd: node.endPosition.row + 1,
         signature: this.extractSignatureLine(source, node),
-        metadata: null,
+        metadata: kind === 'composable' ? this.extractComposableMetadata(valueNode) : null,
       });
 
       this.extractCallEdges(filePath, symbolName, valueNode, edges);
@@ -852,6 +926,7 @@ export class SymbolExtractor {
 
     // Derive component name from filename: BattleGrid.vue → BattleGrid
     const componentName = basename(filePath, extname(filePath));
+    const scriptContent = this.extractScriptBlock(source);
 
     // Add a component node for the whole SFC
     nodes.push({
@@ -862,11 +937,42 @@ export class SymbolExtractor {
       lineStart: 1,
       lineEnd: source.split('\n').length,
       signature: null,
-      metadata: null,
+      metadata: {
+        hasTemplate: /<template\b/i.test(source),
+        script: scriptContent ? (scriptContent.isSetup ? 'setup' : 'standard') : 'none',
+        usesDefineProps: Boolean(scriptContent?.text.match(/\bdefineProps\s*\(/)),
+        usesDefineEmits: Boolean(scriptContent?.text.match(/\bdefineEmits\s*\(/)),
+      },
     });
 
+    const templateBlock = this.extractNamedBlock(source, 'template');
+    if (templateBlock) {
+      nodes.push({
+        filePath,
+        symbolName: `${componentName}<template>`,
+        kind: 'vue_template',
+        language: 'vue',
+        lineStart: templateBlock.startLine,
+        lineEnd: templateBlock.endLine,
+        signature: '<template>',
+        metadata: null,
+      });
+    }
+
+    if (scriptContent) {
+      nodes.push({
+        filePath,
+        symbolName: `${componentName}<script>`,
+        kind: 'vue_script',
+        language: 'vue',
+        lineStart: scriptContent.startLine + 1,
+        lineEnd: scriptContent.endLine,
+        signature: scriptContent.isSetup ? '<script setup>' : '<script>',
+        metadata: { setup: scriptContent.isSetup },
+      });
+    }
+
     // Extract the <script setup> or <script> block content and parse as TypeScript
-    const scriptContent = this.extractScriptBlock(source);
     if (scriptContent) {
       const scriptTree = this.parser.parseString(scriptContent.text, 'typescript');
       const scriptResult = this.extractTypeScript(filePath, scriptTree, 'typescript');
@@ -884,12 +990,49 @@ export class SymbolExtractor {
 
       nodes.push(...scriptResult.nodes);
       edges.push(...scriptResult.edges);
+      edges.push(...this.extractVueLayoutEdges(filePath, componentName, scriptContent.text));
     }
 
     return { nodes, edges };
   }
 
-  private extractScriptBlock(source: string): { text: string; startLine: number } | null {
+  private extractVueLayoutEdges(
+    filePath: string,
+    componentName: string,
+    script: string,
+  ): Partial<WeaveEdge>[] {
+    const layoutNames = new Set<string>();
+    const defineOptionsPattern = /defineOptions\s*\(\s*\{[\s\S]*?\blayout\s*:\s*([A-Za-z_$][\w$]*)/g;
+    const assignmentPattern = /\b(?:[A-Za-z_$][\w$]*|page|Page)\.layout\s*=\s*([A-Za-z_$][\w$]*)/g;
+
+    for (const match of script.matchAll(defineOptionsPattern)) {
+      if (match[1]) {
+        layoutNames.add(match[1]);
+      }
+    }
+    for (const match of script.matchAll(assignmentPattern)) {
+      if (match[1]) {
+        layoutNames.add(match[1]);
+      }
+    }
+
+    return Array.from(layoutNames).map(layoutName => ({
+      sourceId: 0,
+      targetId: 0,
+      relationship: 'renders_child',
+      layer: 2,
+      convention: null,
+      metadata: {
+        sourceSymbol: componentName,
+        targetSymbol: layoutName,
+        sourceFile: filePath,
+        pattern: 'inertia_persistent_layout',
+      },
+      confidence: 0.9,
+    }));
+  }
+
+  private extractScriptBlock(source: string): { text: string; startLine: number; endLine: number; isSetup: boolean } | null {
     const lines = source.split('\n');
 
     // Prefer <script setup> over <script>
@@ -897,7 +1040,7 @@ export class SymbolExtractor {
     let isSetupScript = false;
     let startLine = 0;
     const scriptLines: string[] = [];
-    let bestMatch: { text: string; startLine: number } | null = null;
+    let bestMatch: { text: string; startLine: number; endLine: number; isSetup: boolean } | null = null;
 
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
@@ -916,7 +1059,12 @@ export class SymbolExtractor {
       } else {
         if (trimmed === '</script>') {
           inScript = false;
-          const result = { text: scriptLines.join('\n'), startLine };
+          const result = {
+            text: scriptLines.join('\n'),
+            startLine,
+            endLine: i + 1,
+            isSetup: isSetupScript,
+          };
           // If this is a setup script, prefer it
           if (isSetupScript) {
             return result;
@@ -930,6 +1078,32 @@ export class SymbolExtractor {
     }
 
     return bestMatch;
+  }
+
+  private extractNamedBlock(source: string, tagName: string): { startLine: number; endLine: number } | null {
+    const lines = source.split('\n');
+    let inBlock = false;
+    let startLine = 0;
+    const opening = new RegExp(`^<${tagName}\\b`, 'i');
+    const closing = new RegExp(`^</${tagName}>$`, 'i');
+
+    for (let i = 0; i < lines.length; i++) {
+      const trimmed = lines[i].trim();
+      if (!inBlock && opening.test(trimmed)) {
+        inBlock = true;
+        startLine = i + 1;
+        if (closing.test(trimmed)) {
+          return { startLine, endLine: startLine };
+        }
+        continue;
+      }
+
+      if (inBlock && closing.test(trimmed)) {
+        return { startLine, endLine: i + 1 };
+      }
+    }
+
+    return null;
   }
 
   // ---------------------------------------------------------------------------
@@ -1006,6 +1180,26 @@ export class SymbolExtractor {
       default:
         return node.text || null;
     }
+  }
+
+  private extractComposableMetadata(node: Parser.SyntaxNode): Record<string, boolean> | null {
+    const text = node.text;
+    const metadata: Record<string, boolean> = {};
+
+    if (/\breturn\s*\{/.test(text) || /=>\s*\(\s*\{/.test(text)) {
+      metadata.returnsObject = true;
+    }
+    if (/\bonUnmounted\s*\(/.test(text)) {
+      metadata.usesOnUnmounted = true;
+    }
+    if (/\bclear(?:Timeout|Interval)\s*\(/.test(text)) {
+      metadata.clearsTimers = true;
+    }
+    if (/\bset(?:Timeout|Interval)\s*\(/.test(text)) {
+      metadata.usesTimers = true;
+    }
+
+    return Object.keys(metadata).length > 0 ? metadata : null;
   }
 
   /**

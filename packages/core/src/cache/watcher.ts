@@ -3,9 +3,9 @@ import crypto from 'node:crypto';
 import { glob } from 'glob';
 import { GraphStore } from '../graph/store.js';
 
-const SOURCE_EXTENSIONS = ['.php', '.ts', '.tsx', '.js', '.jsx', '.vue', '.py'];
+const SOURCE_EXTENSIONS = ['.php', '.ts', '.tsx', '.js', '.jsx', '.vue', '.py', '.md'];
 
-const EXCLUDED_DIRS = ['node_modules', 'vendor', 'dist', '.git', '.weave'];
+const EXCLUDED_DIRS = ['node_modules', 'vendor', 'dist', '.git', '.weave', 'public/build'];
 
 export class FileWatcher {
   private store: GraphStore;
