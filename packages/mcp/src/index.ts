@@ -57,6 +57,7 @@ export function summarizeStatus(projectRoot: string, status: WeaveStatus) {
       `layer:${issue.layer}`,
       issue.plugin ? `plugin:${issue.plugin}` : null,
       issue.rule ? `rule:${issue.rule}` : null,
+      issue.classification ? `class:${issue.classification}` : null,
       `reason:${issue.reason}`,
     ].filter(Boolean).join(' ');
     counts.set(key, (counts.get(key) ?? 0) + 1);
@@ -79,6 +80,9 @@ export function summarizeStatus(projectRoot: string, status: WeaveStatus) {
         l3EdgesCreated: status.diagnostics.totals.l3EdgesCreated,
         queryErrors: status.diagnostics.totals.queryErrors,
         issueCount,
+        externalIssues: status.diagnostics.totals.externalIssues,
+        internalIssues: status.diagnostics.totals.internalIssues,
+        unknownIssues: status.diagnostics.totals.unknownIssues,
       },
       issueBreakdown,
       topFiles: noisyFiles,
@@ -371,14 +375,28 @@ export function createServer(projectRootArg?: string): McpServer {
 
   server.tool(
     'weave_validate',
-    'Check files against derived conventions',
+    'Check explicit files or the current uncommitted git worktree against derived codebase conventions',
     {
-      files: z.array(z.string()).describe('File paths to validate (relative to project root)'),
+      files: z.array(z.string()).optional().describe('File paths to validate (relative to project root). If omitted, validates uncommitted git files.'),
+      changedOnly: z.boolean().optional().describe('Validate uncommitted git files even when files are provided'),
+      stagedOnly: z.boolean().optional().describe('Validate staged git files for pre-commit pattern checks'),
+      includeSpecCoverage: z.boolean().optional().describe('Also report coverage against the active or provided spec; off by default'),
+      fromSpec: z.string().optional().describe('Optional markdown spec/design doc path for spec coverage only'),
+      fromSpecText: z.string().optional().describe('Optional inline markdown spec/design doc content'),
     },
-    async ({ files }) => {
+    async ({ files, changedOnly, stagedOnly, includeSpecCoverage, fromSpec, fromSpecText }) => {
       try {
-        await runtime.ensureReady();
-        const result = runtime.weave.validateWithSummary(files);
+        await runtime.ensureReady(true);
+        const spec = includeSpecCoverage || fromSpec || fromSpecText
+          ? (fromSpec || fromSpecText ? { fromSpec, fromSpecText } : runtime.activeSpec())
+          : {};
+        const result = runtime.weave.validateWithSummary(files ?? [], {
+          changedOnly,
+          stagedOnly,
+          includeSpecCoverage: Boolean(includeSpecCoverage || fromSpec || fromSpecText),
+          fromSpec: spec.fromSpec,
+          fromSpecText: spec.fromSpecText,
+        });
         return jsonResult(result);
       } catch (error) {
         return errorResult(error);

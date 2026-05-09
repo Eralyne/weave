@@ -2,6 +2,7 @@ import type {
   FileIndexDiagnostics,
   IndexingDiagnostics,
   IndexingIssue,
+  IndexingIssueClassification,
   PluginRuleDiagnostics,
 } from './types.js';
 
@@ -25,12 +26,14 @@ export class IndexingDiagnosticsCollector {
     relationship: string | undefined,
     reason: string,
     details?: Record<string, unknown>,
+    classification: IndexingIssueClassification = 'unknown',
   ): void {
     this.ensureFile(file).l2EdgesSkipped += 1;
     this.issues.push({
       file,
       layer: 2,
       reason,
+      classification,
       relationship,
       details: details ?? null,
     });
@@ -57,6 +60,7 @@ export class IndexingDiagnosticsCollector {
     relationship: string | undefined,
     reason: string,
     details?: Record<string, unknown>,
+    classification: IndexingIssueClassification = 'unknown',
   ): void {
     this.ensurePluginRule(plugin, rule).edgesSkipped += 1;
     this.ensureFile(file).l3EdgesSkipped += 1;
@@ -67,6 +71,7 @@ export class IndexingDiagnosticsCollector {
       rule,
       relationship,
       reason,
+      classification,
       details: details ?? null,
     });
   }
@@ -95,6 +100,7 @@ export class IndexingDiagnosticsCollector {
       plugin,
       rule,
       reason: 'query_error',
+      classification: 'unknown',
       details: {
         message: error instanceof Error ? error.message : String(error),
       },
@@ -120,6 +126,9 @@ export class IndexingDiagnosticsCollector {
         metadataUpdates: files.reduce((sum, file) => sum + file.metadataUpdates, 0),
         queryErrors: files.reduce((sum, file) => sum + file.queryErrors, 0),
         issues: issues.length,
+        externalIssues: issues.filter(issue => issue.classification === 'external_dependency').length,
+        internalIssues: issues.filter(issue => issue.classification === 'internal_unresolved').length,
+        unknownIssues: issues.filter(issue => !issue.classification || issue.classification === 'unknown').length,
       },
       files,
       pluginRules,

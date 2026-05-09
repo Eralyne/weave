@@ -285,16 +285,29 @@ export function run(argv: string[]): void {
 
   // --- validate ---
   program
-    .command('validate <files...>')
-    .description('Validate files against derived conventions')
+    .command('validate [files...]')
+    .description('Validate files or the current git changes against derived conventions')
     .option('--strict', 'Treat warnings as errors')
     .option('--exit-code', 'Exit with code 1 if violations found')
-    .action(async (files: string[], opts: { strict?: boolean; exitCode?: boolean }) => {
+    .option('--changed', 'Validate uncommitted git files instead of explicit files')
+    .option('--staged', 'Validate staged git files for pre-commit checks')
+    .action(async (files: string[] = [], opts: { strict?: boolean; exitCode?: boolean; changed?: boolean; staged?: boolean }) => {
       try {
-        const violations = await withWeave(weave => weave.validate(files));
+        const validation = await withWeave(weave => weave.validateWithSummary(files, {
+          changedOnly: opts.changed,
+          stagedOnly: opts.staged,
+        }));
+        const violations = validation.violations;
 
         if (violations.length === 0) {
-          console.log(chalk.green('All files pass convention checks.'));
+          console.log(chalk.green(validation.summary.message));
+          for (const gap of validation.evidenceGaps ?? []) {
+            console.log(chalk.yellow(`GAP    ${chalk.bold(gap.file)} ${chalk.dim(gap.kind ?? 'unknown')}`));
+            console.log(`       ${gap.message}`);
+            if (gap.exemplarFile) {
+              console.log(`       ${chalk.dim(`Nearest evidence: ${gap.exemplarFile}`)}`);
+            }
+          }
           return;
         }
 
@@ -317,6 +330,9 @@ export function run(argv: string[]): void {
         console.log(
           `${chalk.red(`${errorCount} error(s)`)}  ${chalk.yellow(`${warnCount} warning(s)`)}`,
         );
+        if ((validation.evidenceGaps ?? []).length > 0) {
+          console.log(chalk.yellow(`${validation.evidenceGaps?.length ?? 0} pattern evidence gap(s)`));
+        }
 
         if (opts.exitCode && errorCount > 0) {
           process.exitCode = 1;

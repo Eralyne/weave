@@ -121,12 +121,13 @@ describe('MCP request mapping', () => {
           metadataUpdates: 0,
           queryErrors: 0,
           issues: 6,
+          externalIssues: 4,
+          internalIssues: 2,
+          unknownIssues: 0,
         },
         files: [
           {
             file: 'routes/web.php',
-            l1NodesCreated: 1,
-            l1EdgesCreated: 1,
             l2EdgesCreated: 1,
             l2EdgesSkipped: 2,
             l3EdgesCreated: 0,
@@ -153,6 +154,7 @@ describe('MCP request mapping', () => {
           file: `file-${index}.php`,
           layer: 2 as const,
           reason: 'missing_target' as const,
+          classification: index < 4 ? 'external_dependency' as const : 'internal_unresolved' as const,
         })),
       },
     };
@@ -165,6 +167,8 @@ describe('MCP request mapping', () => {
       staleFileCount: 0,
     }));
     expect(summary.diagnostics.summary.issueCount).toBe(6);
+    expect(summary.diagnostics.summary.externalIssues).toBe(4);
+    expect(summary.diagnostics.summary.internalIssues).toBe(2);
     expect(summary.diagnostics.topFiles).toHaveLength(1);
     expect(summary.diagnostics.truncated.issues).toBe(6);
     expect(JSON.stringify(summary).length).toBeLessThan(JSON.stringify(status).length);
@@ -237,6 +241,44 @@ describe('MCP request mapping', () => {
       expect(specQueryText.type).toBe('text');
       expect(JSON.parse(specQueryText.text).specContext).toEqual(expect.objectContaining({
         file: 'docs/SPEC.md',
+      }));
+
+      const validateResult = await client.callTool({
+        name: 'weave_validate',
+        arguments: {
+          files: ['resources/js/Pages/Orders/Status.vue'],
+        },
+      });
+      const validateText = validateResult.content[0];
+      expect(validateText.type).toBe('text');
+      const validate = JSON.parse(validateText.text);
+      expect(validate.summary.source).toBe('explicit_files');
+      expect(validate.specCoverage).toBeUndefined();
+
+      const specValidateResult = await client.callTool({
+        name: 'weave_validate',
+        arguments: {
+          files: ['resources/js/Pages/Orders/Status.vue'],
+          includeSpecCoverage: true,
+        },
+      });
+      const specValidateText = specValidateResult.content[0];
+      expect(specValidateText.type).toBe('text');
+      expect(JSON.parse(specValidateText.text).specCoverage).toEqual(expect.objectContaining({
+        file: 'docs/SPEC.md',
+        uncheckedExpectedFiles: expect.arrayContaining([
+          'resources/js/Pages/Lore/Index.vue',
+        ]),
+      }));
+
+      const worktreeValidateResult = await client.callTool({
+        name: 'weave_validate',
+        arguments: {},
+      });
+      const worktreeValidateText = worktreeValidateResult.content[0];
+      expect(worktreeValidateText.type).toBe('text');
+      expect(JSON.parse(worktreeValidateText.text).worktree).toEqual(expect.objectContaining({
+        source: 'git_uncommitted',
       }));
     } finally {
       await client.close();

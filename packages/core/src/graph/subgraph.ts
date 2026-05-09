@@ -178,6 +178,7 @@ export class SubgraphExtractor {
     const rankedCrossFileNodes = this.rankImpactCrossFileNodes(
       result.impact.crossFileNodes,
       result.impact.crossFileEdges,
+      options,
     );
     for (const node of rankedCrossFileNodes.slice(0, maxNodes)) {
       keepNodeIds.add(node.id);
@@ -219,6 +220,11 @@ export class SubgraphExtractor {
     const shownKindBreakdown = this.countNodesByKind(impact.crossFileNodes);
     const totalKindBreakdown = this.countNodesByKind(result.impact.crossFileNodes);
     const kindBreakdown = this.mergeKindBreakdowns(shownKindBreakdown, totalKindBreakdown);
+    const topFiles = this.rankImpactTopFiles(
+      result.impact.crossFileNodes,
+      result.impact.crossFileEdges,
+      options,
+    ).slice(0, options.summary ? 10 : 20);
     const truncated = impact.counts.crossFileNodes < totalCounts.crossFileNodes
       || impact.counts.crossFileEdges < totalCounts.crossFileEdges
       || impact.counts.intraFileEdges < totalCounts.intraFileEdges;
@@ -234,6 +240,7 @@ export class SubgraphExtractor {
       impact: {
         ...impact,
         kindBreakdown,
+        topFiles,
         totalCounts,
         truncated,
         budget: {
@@ -297,6 +304,7 @@ export class SubgraphExtractor {
         this.countNodesByKind(crossFileNodes),
         this.countNodesByKind(crossFileNodes),
       ),
+      topFiles: this.rankImpactTopFiles(crossFileNodes, crossFileEdges),
       counts: {
         crossFileNodes: crossFileNodes.length,
         crossFileEdges: crossFileEdges.length,
@@ -313,9 +321,74 @@ export class SubgraphExtractor {
     return counts;
   }
 
+  private rankImpactTopFiles(
+    crossFileNodes: SubgraphNode[],
+    crossFileEdges: SubgraphEdge[],
+    options: SubgraphOptions = {},
+  ): NonNullable<ImpactAnalysis['topFiles']> {
+    const nodeById = new Map(crossFileNodes.map(node => [node.id, node] as const));
+    const entries = new Map<string, {
+      file: string;
+      kinds: Set<string>;
+      edgeCount: number;
+      relationships: Map<string, number>;
+    }>();
+
+    const ensureEntry = (node: SubgraphNode) => {
+      const existing = entries.get(node.file);
+      if (existing) {
+        existing.kinds.add(node.kind);
+        return existing;
+      }
+      const created = {
+        file: node.file,
+        kinds: new Set<string>([node.kind]),
+        edgeCount: 0,
+        relationships: new Map<string, number>(),
+      };
+      entries.set(node.file, created);
+      return created;
+    };
+
+    for (const node of crossFileNodes) {
+      ensureEntry(node);
+    }
+    for (const edge of crossFileEdges) {
+      const candidates = [nodeById.get(edge.from), nodeById.get(edge.to)]
+        .filter((node): node is SubgraphNode => Boolean(node));
+      for (const node of candidates) {
+        const entry = ensureEntry(node);
+        entry.edgeCount += 1;
+        entry.relationships.set(edge.relationship, (entry.relationships.get(edge.relationship) ?? 0) + 1);
+      }
+    }
+
+    return Array.from(entries.values())
+      .map(entry => ({
+        file: entry.file,
+        kinds: Array.from(entry.kinds).sort(),
+        edgeCount: entry.edgeCount,
+        relationships: Object.fromEntries(
+          Array.from(entry.relationships.entries())
+            .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])),
+        ),
+      }))
+      .sort((a, b) =>
+        this.impactFileTaskScore(b.file, options) - this.impactFileTaskScore(a.file, options)
+        || b.edgeCount - a.edgeCount
+        || this.impactTopFileKindPriority(b.kinds) - this.impactTopFileKindPriority(a.kinds)
+        || a.file.localeCompare(b.file),
+      );
+  }
+
+  private impactTopFileKindPriority(kinds: string[]): number {
+    return Math.max(0, ...kinds.map(kind => this.impactKindPriority(kind)));
+  }
+
   private rankImpactCrossFileNodes(
     nodes: SubgraphNode[],
     edges: SubgraphEdge[],
+    options: SubgraphOptions = {},
   ): SubgraphNode[] {
     const scores = new Map<number, number>();
     for (const edge of edges) {
@@ -325,11 +398,54 @@ export class SubgraphExtractor {
     }
 
     return [...nodes].sort((a, b) =>
-      (scores.get(b.id) ?? 0) - (scores.get(a.id) ?? 0)
+      this.impactFileTaskScore(b.file, options) - this.impactFileTaskScore(a.file, options)
+      || (scores.get(b.id) ?? 0) - (scores.get(a.id) ?? 0)
       || this.impactKindPriority(b.kind) - this.impactKindPriority(a.kind)
       || a.file.localeCompare(b.file)
       || a.lines[0] - b.lines[0],
     );
+  }
+
+  private impactFileTaskScore(filePath: string, options: SubgraphOptions): number {
+    const terms = this.impactTaskTerms(options);
+    if (terms.length === 0) {
+      return 0;
+    }
+
+    const fileTokens = new Set(
+      filePath
+        .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+        .toLowerCase()
+        .split(/[^a-z0-9]+/)
+        .filter(token => token.length >= 3),
+    );
+    let score = 0;
+    for (const term of terms) {
+      if (fileTokens.has(term)) {
+        score += 18;
+      } else if (filePath.toLowerCase().includes(term)) {
+        score += 6;
+      }
+    }
+    return score;
+  }
+
+  private impactTaskTerms(options: SubgraphOptions): string[] {
+    const text = [options.task, options.scope].filter(Boolean).join(' ');
+    if (!text) {
+      return [];
+    }
+    const stopwords = new Set([
+      'add', 'build', 'change', 'create', 'edit', 'feature', 'file', 'fix', 'from',
+      'implement', 'line', 'lines', 'new', 'scope', 'task', 'the', 'this', 'update',
+      'use', 'using', 'with',
+    ]);
+    return Array.from(new Set(text
+      .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .map(term => term.trim())
+      .filter(term => term.length >= 3 && !stopwords.has(term))));
   }
 
   private impactRelationshipWeight(relationship: string): number {
@@ -362,6 +478,7 @@ export class SubgraphExtractor {
       case 'model':
       case 'service':
       case 'migration':
+      case 'test':
         return 8;
       default:
         return 1;

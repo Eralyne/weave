@@ -2,6 +2,7 @@ import type Parser from 'tree-sitter';
 import type { WeaveNode, WeaveEdge } from '../types.js';
 import type { TreeSitterParser } from './parser.js';
 import { basename, extname } from 'path';
+import { isTestFilePath } from '../path-utils.js';
 
 interface ExtractionResult {
   nodes: Partial<WeaveNode>[];
@@ -30,27 +31,57 @@ export class SymbolExtractor {
   extractFull(filePath: string): ExtractionResult {
     const language = this.parser.getLanguage(filePath);
 
+    let result: ExtractionResult;
     if (language === 'vue') {
-      return this.extractVue(filePath);
-    }
-    if (language === 'markdown') {
-      return this.extractMarkdown(filePath);
+      result = this.extractVue(filePath);
+    } else if (language === 'markdown') {
+      result = this.extractMarkdown(filePath);
+    } else {
+      const tree = this.parser.parse(filePath);
+
+      switch (language) {
+        case 'php':
+          result = this.extractPhp(filePath, tree);
+          break;
+        case 'typescript':
+        case 'tsx':
+        case 'javascript':
+          result = this.extractTypeScript(filePath, tree, language);
+          break;
+        case 'python':
+          result = this.extractPython(filePath, tree);
+          break;
+        default:
+          result = { nodes: [], edges: [] };
+          break;
+      }
     }
 
-    const tree = this.parser.parse(filePath);
-
-    switch (language) {
-      case 'php':
-        return this.extractPhp(filePath, tree);
-      case 'typescript':
-      case 'tsx':
-      case 'javascript':
-        return this.extractTypeScript(filePath, tree, language);
-      case 'python':
-        return this.extractPython(filePath, tree);
-      default:
-        return { nodes: [], edges: [] };
+    const testNode = this.extractTestFileNode(filePath, language);
+    if (testNode && !result.nodes.some(node => node.kind === 'test')) {
+      result.nodes.unshift(testNode);
     }
+    return result;
+  }
+
+  private extractTestFileNode(filePath: string, language: string): Partial<WeaveNode> | null {
+    if (!isTestFilePath(filePath)) {
+      return null;
+    }
+
+    const source = this.parser.readSource(filePath);
+    const lines = source.split('\n');
+    const symbolName = basename(filePath, extname(filePath));
+    return {
+      filePath,
+      symbolName,
+      kind: 'test',
+      language,
+      lineStart: 1,
+      lineEnd: Math.max(1, lines.length),
+      signature: symbolName,
+      metadata: { role: 'test' },
+    };
   }
 
   private extractMarkdown(filePath: string): ExtractionResult {
@@ -127,6 +158,12 @@ export class SymbolExtractor {
         case 'class_declaration':
           this.extractPhpClass(filePath, child, source, namespace, nodes, edges);
           break;
+        case 'trait_declaration':
+          this.extractPhpTrait(filePath, child, source, namespace, nodes);
+          break;
+        case 'enum_declaration':
+          this.extractPhpEnum(filePath, child, source, namespace, nodes);
+          break;
         case 'use_declaration':
         case 'namespace_use_declaration':
           this.extractPhpUse(filePath, child, edges);
@@ -154,6 +191,12 @@ export class SymbolExtractor {
           break;
         case 'class_declaration':
           this.extractPhpClass(filePath, child, source, namespace, nodes, edges);
+          break;
+        case 'trait_declaration':
+          this.extractPhpTrait(filePath, child, source, namespace, nodes);
+          break;
+        case 'enum_declaration':
+          this.extractPhpEnum(filePath, child, source, namespace, nodes);
           break;
         case 'use_declaration':
         case 'namespace_use_declaration':
@@ -263,6 +306,54 @@ export class SymbolExtractor {
     });
   }
 
+  private extractPhpTrait(
+    filePath: string,
+    node: Parser.SyntaxNode,
+    source: string,
+    namespace: string,
+    nodes: Partial<WeaveNode>[],
+  ): void {
+    const nameNode = node.childForFieldName('name');
+    if (!nameNode) return;
+
+    nodes.push({
+      filePath,
+      symbolName: nameNode.text,
+      kind: 'trait',
+      language: 'php',
+      lineStart: node.startPosition.row + 1,
+      lineEnd: node.endPosition.row + 1,
+      signature: this.extractSignatureLine(source, node),
+      metadata: {
+        namespace: namespace || null,
+      },
+    });
+  }
+
+  private extractPhpEnum(
+    filePath: string,
+    node: Parser.SyntaxNode,
+    source: string,
+    namespace: string,
+    nodes: Partial<WeaveNode>[],
+  ): void {
+    const nameNode = node.childForFieldName('name');
+    if (!nameNode) return;
+
+    nodes.push({
+      filePath,
+      symbolName: nameNode.text,
+      kind: 'enum',
+      language: 'php',
+      lineStart: node.startPosition.row + 1,
+      lineEnd: node.endPosition.row + 1,
+      signature: this.extractSignatureLine(source, node),
+      metadata: {
+        namespace: namespace || null,
+      },
+    });
+  }
+
   private extractPhpUse(
     filePath: string,
     node: Parser.SyntaxNode,
@@ -276,7 +367,7 @@ export class SymbolExtractor {
         || child.type === 'qualified_name'
         || child.type === 'name'
       ) {
-        const fullName = child.text;
+        const fullName = child.text.split(/\s+as\s+/i)[0]?.trim() ?? child.text;
         edges.push({
           sourceId: 0,
           targetId: 0,

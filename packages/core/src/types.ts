@@ -255,6 +255,7 @@ export interface BootstrapSpecContext {
   plannedFilePatterns?: BootstrapPlannedFilePattern[];
   suspiciousReferences: string[];
   novelPathPrefixes: string[];
+  mentionsTests?: boolean;
   terms?: string[];
   termIndex?: string[];
 }
@@ -359,6 +360,19 @@ export interface ImpactAnalysis {
   crossFileEdges: SubgraphEdge[];
   intraFileEdges: SubgraphEdge[];
   kindBreakdown?: Record<string, { shown: number; total: number }>;
+  topFiles?: Array<{
+    file: string;
+    kinds: string[];
+    edgeCount: number;
+    relationships: Record<string, number>;
+  }>;
+  specTouchpoints?: Array<{
+    file: string;
+    status: 'target' | 'impacted' | 'spec_related_not_impacted';
+    reason: string;
+    lineStart?: number;
+    lineEnd?: number;
+  }>;
   counts: {
     crossFileNodes: number;
     crossFileEdges: number;
@@ -372,6 +386,8 @@ export interface ImpactAnalysis {
   truncated?: boolean;
   budget?: {
     summary: boolean;
+    autoSummarized?: boolean;
+    autoSummaryReason?: string;
     maxTokens?: number;
     maxNodes: number;
     maxEdges: number;
@@ -441,6 +457,8 @@ export interface ValidationSummary {
   checkedNodes: number;
   checkedRules: number;
   violations: number;
+  evidenceGaps?: number;
+  source?: 'explicit_files' | 'git_uncommitted' | 'git_staged';
   message: string;
 }
 
@@ -473,10 +491,38 @@ export interface ValidationViolation {
   message: string;
 }
 
+export interface ValidationEvidenceGap {
+  file: string;
+  kind: string | null;
+  reason: 'unknown_kind' | 'no_high_confidence_conventions' | 'no_indexed_nodes';
+  conventionsFound: number;
+  highestConfidence: number | null;
+  exemplarFile: string | null;
+  message: string;
+}
+
 export interface ValidationResult {
   violations: ValidationViolation[];
   summary: ValidationSummary;
   checks: ValidationRuleCheck[];
+  evidenceGaps?: ValidationEvidenceGap[];
+  worktree?: {
+    source: 'explicit_files' | 'git_uncommitted' | 'git_staged';
+    checkedFiles: string[];
+    changedFiles: string[];
+    deletedFiles: string[];
+    unavailableReason?: string;
+    message: string;
+  };
+  specCoverage?: {
+    file: string;
+    checkedFiles: string[];
+    expectedFiles: string[];
+    checkedExpectedFiles: string[];
+    uncheckedExpectedFiles: string[];
+    missingExpectedFiles: string[];
+    message: string;
+  };
 }
 
 // -- Convention override config --
@@ -497,10 +543,16 @@ export interface WeaveConfig {
 
 // -- Indexing diagnostics --
 
+export type IndexingIssueClassification =
+  | 'external_dependency'
+  | 'internal_unresolved'
+  | 'unknown';
+
 export interface IndexingIssue {
   file: string;
   layer: 2 | 3;
   reason: string;
+  classification?: IndexingIssueClassification;
   relationship?: string;
   plugin?: string;
   rule?: string;
@@ -540,6 +592,9 @@ export interface IndexingDiagnostics {
     metadataUpdates: number;
     queryErrors: number;
     issues: number;
+    externalIssues: number;
+    internalIssues: number;
+    unknownIssues: number;
   };
   files: FileIndexDiagnostics[];
   pluginRules: PluginRuleDiagnostics[];

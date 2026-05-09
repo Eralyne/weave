@@ -174,6 +174,8 @@ export class PluginRunner {
     const relativeFilePath = this.relPath(filePath);
 
     if (sourceNodes.length === 0 || targetNodes.length === 0) {
+      const resolvedFrom = this.edgeEndpointValue(edge.from, captures);
+      const resolvedTo = this.edgeEndpointValue(edge.to, captures);
       diagnostics?.recordL3EdgeSkipped(
         pluginName,
         ruleName,
@@ -183,7 +185,11 @@ export class PluginRunner {
         {
           from: typeof edge.from === 'string' ? edge.from : edge.from,
           to: typeof edge.to === 'string' ? edge.to : edge.to,
+          resolvedFrom,
+          resolvedTo,
+          captures: Object.fromEntries(captures),
         },
+        this.classifyMissingEndpoint(edge, captures, filePath, sourceNodes.length === 0, targetNodes.length === 0),
       );
       return;
     }
@@ -394,6 +400,7 @@ export class PluginRunner {
         listener: 95,
         service: 95,
         config_array: 95,
+        test: 95,
         route_definition: 95,
         composable: 90,
         component: 85,
@@ -717,5 +724,160 @@ export class PluginRunner {
     if (sourceMissing) return 'missing_source';
     if (targetMissing) return 'missing_target';
     return 'unknown';
+  }
+
+  private classifyMissingEndpoint(
+    edge: EdgeCreation,
+    captures: Captures,
+    filePath: string,
+    sourceMissing: boolean,
+    targetMissing: boolean,
+  ): 'external_dependency' | 'internal_unresolved' | 'unknown' {
+    if (sourceMissing) {
+      return 'internal_unresolved';
+    }
+    if (!targetMissing) {
+      return 'unknown';
+    }
+
+    const targetValue = this.edgeEndpointValue(edge.to, captures);
+    if (!targetValue) {
+      return 'unknown';
+    }
+    if (this.endpointResolvesExternalImport(edge.to, targetValue, filePath)) {
+      return 'external_dependency';
+    }
+    if (this.isExternalEndpoint(targetValue)) {
+      return 'external_dependency';
+    }
+    return 'internal_unresolved';
+  }
+
+  private edgeEndpointValue(endpoint: EdgeCreation['to'], captures: Captures): string | null {
+    if (typeof endpoint === 'string') {
+      return this.resolveValue(endpoint, captures);
+    }
+    if ('resolve' in endpoint) {
+      return this.resolveValue(endpoint.resolve, captures);
+    }
+    if ('resolve_class' in endpoint) {
+      return this.resolveValue(endpoint.resolve_class, captures);
+    }
+    if ('resolve_import' in endpoint) {
+      return this.resolveValue(endpoint.resolve_import, captures);
+    }
+    if ('resolve_migration' in endpoint) {
+      return this.resolveValue(endpoint.resolve_migration, captures);
+    }
+    if ('all_of_kind' in endpoint) {
+      return endpoint.all_of_kind;
+    }
+    return null;
+  }
+
+  private isExternalEndpoint(value: string): boolean {
+    if (value.startsWith('@')) {
+      return false;
+    }
+    if (value.startsWith('current_')) {
+      return false;
+    }
+    if (/^(?:app|src|resources|routes|config|database|tests?)\//i.test(value)) {
+      return false;
+    }
+    if (/^(?:App|Src)\\/.test(value)) {
+      return false;
+    }
+    if (value.includes('\\') && !/^(?:App|Src)\\/.test(value)) {
+      return true;
+    }
+    return /^(?:Illuminate|Inertia|Laravel|Lorisleiva|Symfony|Carbon|Spatie|Pest|PHPUnit|Vue)\\/.test(value)
+      || this.isKnownExternalClassName(value);
+  }
+
+  private endpointResolvesExternalImport(
+    endpoint: EdgeCreation['to'],
+    symbolName: string,
+    filePath: string,
+  ): boolean {
+    if (typeof endpoint !== 'object' || !('resolve_import' in endpoint)) {
+      return false;
+    }
+    return this.symbolImportedFromExternalModule(symbolName, filePath);
+  }
+
+  private symbolImportedFromExternalModule(symbolName: string, filePath: string): boolean {
+    const source = this.parser.readSource(filePath);
+    const importRegex = /import\s+([^'";]+?)\s+from\s+['"]([^'"]+)['"]/g;
+    for (const match of source.matchAll(importRegex)) {
+      const clause = match[1]?.trim() ?? '';
+      const moduleSpecifier = match[2]?.trim() ?? '';
+      if (!this.isExternalModuleSpecifier(moduleSpecifier)) {
+        continue;
+      }
+      if (this.importClauseContainsSymbol(clause, symbolName)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private importClauseContainsSymbol(clause: string, symbolName: string): boolean {
+    const defaultPart = clause.split(',')[0]?.trim();
+    if (defaultPart === symbolName) {
+      return true;
+    }
+
+    const namespaceMatch = clause.match(/\*\s+as\s+([A-Za-z_$][\w$]*)/);
+    if (namespaceMatch?.[1] === symbolName) {
+      return true;
+    }
+
+    const namedMatch = clause.match(/\{([^}]+)\}/);
+    if (!namedMatch) {
+      return false;
+    }
+    return namedMatch[1]
+      .split(',')
+      .map(part => part.trim())
+      .filter(Boolean)
+      .some(part => {
+        const local = part.match(/\bas\s+([A-Za-z_$][\w$]*)$/)?.[1] ?? part;
+        return local.trim() === symbolName;
+      });
+  }
+
+  private isExternalModuleSpecifier(moduleSpecifier: string): boolean {
+    return Boolean(moduleSpecifier)
+      && !moduleSpecifier.startsWith('.')
+      && !moduleSpecifier.startsWith('/')
+      && !moduleSpecifier.startsWith('@/')
+      && !moduleSpecifier.startsWith('~/');
+  }
+
+  private isKnownExternalClassName(value: string): boolean {
+    return new Set([
+      'ActionRequest',
+      'Authenticatable',
+      'BaseTestCase',
+      'Blueprint',
+      'Closure',
+      'Command',
+      'Exception',
+      'Factory',
+      'FormRequest',
+      'LengthAwarePaginator',
+      'Mailable',
+      'Migration',
+      'Middleware',
+      'Model',
+      'RedirectResponse',
+      'Request',
+      'Response',
+      'Seeder',
+      'ServiceProvider',
+      'TelescopeApplicationServiceProvider',
+      'Throwable',
+    ]).has(value);
   }
 }

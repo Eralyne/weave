@@ -1,9 +1,10 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { basename, extname, join } from 'node:path';
 import { ConventionEngine } from './engine.js';
-import { toProjectRelative } from '../path-utils.js';
+import { isTestFilePath, toProjectRelative } from '../path-utils.js';
 import type {
   Convention,
+  ValidationEvidenceGap,
   ValidationRuleCheck,
   ValidationResult,
   ValidationSummary,
@@ -45,9 +46,10 @@ export class ConventionValidator {
     return this.validateWithSummary(filePaths).violations;
   }
 
-  validateWithSummary(filePaths: string[]): ValidationResult {
+  validateWithSummary(filePaths: string[], source: ValidationSummary['source'] = 'explicit_files'): ValidationResult {
     const violations: ValidationViolation[] = [];
     const checks: ValidationRuleCheck[] = [];
+    const evidenceGaps: ValidationEvidenceGap[] = [];
     const semanticState = this.getInertiaSharedPropsState();
     let checkedNodes = 0;
 
@@ -60,10 +62,12 @@ export class ConventionValidator {
         const fileViolations = this.validateNodes(relativePath, fileNodes);
         violations.push(...fileViolations);
         checks.push(...this.buildRuleChecks(relativePath, fileNodes, fileViolations));
+        evidenceGaps.push(...this.buildEvidenceGaps(relativePath, fileNodes));
       } else {
         const predictive = this.validatePlannedFile(relativePath);
         violations.push(...predictive.violations);
         checks.push(...predictive.checks);
+        evidenceGaps.push(...this.buildPlannedEvidenceGaps(relativePath, predictive.checks));
       }
 
       if (semanticState) {
@@ -79,8 +83,11 @@ export class ConventionValidator {
         checks.length,
         violations.length,
         checks.filter(check => check.status === 'pending').length,
+        evidenceGaps.length,
+        source,
       ),
       checks,
+      evidenceGaps,
     };
   }
 
@@ -174,6 +181,7 @@ export class ConventionValidator {
     if (filePath.startsWith('database/migrations/')) return 'migration';
     if (filePath.startsWith('config/') && filePath.endsWith('.php')) return 'config_array';
     if (filePath.startsWith('app/Http/Requests/')) return 'form_request';
+    if (isTestFilePath(filePath)) return 'test';
     if (filePath.startsWith('resources/js/Pages/') && filePath.endsWith('.vue')) return 'inertia_page';
     if (filePath.startsWith('resources/js/Components/') && filePath.endsWith('.vue')) return 'component';
     if (filePath.startsWith('resources/js/composables/') && /\/use[A-Z].*\.(?:js|ts)$/.test(filePath)) return 'composable';
@@ -234,20 +242,122 @@ export class ConventionValidator {
     return checks;
   }
 
+  private buildEvidenceGaps(filePath: string, nodes: WeaveNode[]): ValidationEvidenceGap[] {
+    const inferredKind = this.inferKindForPath(filePath);
+    const indexedKinds = new Set(nodes.map(node => node.kind));
+    const kindSet = new Set<string>();
+
+    if (inferredKind) {
+      if (!indexedKinds.has(inferredKind)) {
+        return [this.evidenceGap(filePath, inferredKind, 'no_indexed_nodes')];
+      }
+      kindSet.add(inferredKind);
+    } else {
+      for (const node of nodes) {
+        if (this.isPatternValidatedKind(node.kind)) {
+          kindSet.add(node.kind);
+        }
+      }
+    }
+
+    if (kindSet.size === 0) {
+      return [this.evidenceGap(filePath, inferredKind, inferredKind ? 'no_indexed_nodes' : 'unknown_kind')];
+    }
+
+    const gaps: ValidationEvidenceGap[] = [];
+    for (const kind of kindSet) {
+      const conventions = this.engine.getConventions(kind);
+      if (conventions.some(convention => convention.confidence >= 0.9)) {
+        continue;
+      }
+      gaps.push(this.evidenceGap(filePath, kind, 'no_high_confidence_conventions'));
+    }
+    return gaps;
+  }
+
+  private isPatternValidatedKind(kind: string): boolean {
+    return [
+      'action',
+      'component',
+      'composable',
+      'config_array',
+      'form_request',
+      'inertia_page',
+      'migration',
+      'model',
+      'service',
+      'test',
+    ].includes(kind);
+  }
+
+  private buildPlannedEvidenceGaps(
+    filePath: string,
+    checks: ValidationRuleCheck[],
+  ): ValidationEvidenceGap[] {
+    if (checks.length > 0) {
+      return [];
+    }
+
+    const kind = this.inferKindForPath(filePath);
+    return [this.evidenceGap(filePath, kind, kind ? 'no_high_confidence_conventions' : 'unknown_kind')];
+  }
+
+  private evidenceGap(
+    filePath: string,
+    kind: string | null,
+    reason: ValidationEvidenceGap['reason'],
+  ): ValidationEvidenceGap {
+    const conventions = kind ? this.engine.getConventions(kind) : [];
+    const sorted = [...conventions].sort((a, b) => b.confidence - a.confidence);
+    const highest = sorted[0] ?? null;
+    const exemplarFile = highest?.exemplarId !== null && highest?.exemplarId !== undefined
+      ? this.store.getNodeById(highest.exemplarId)?.filePath ?? null
+      : null;
+    const highestConfidence = highest?.confidence ?? null;
+    const kindLabel = kind ?? 'unknown kind';
+
+    let message: string;
+    if (reason === 'unknown_kind') {
+      message = `${filePath} does not match a known Weave file kind, so no codebase pattern checks were applied.`;
+    } else if (reason === 'no_indexed_nodes') {
+      message = `${filePath} looks like a ${kindLabel}, but Weave has no indexed ${kindLabel} nodes for it; validate again after indexing or pass the concrete generated file.`;
+    } else {
+      message = `${filePath} looks like a ${kindLabel}, but Weave has no high-confidence ${kindLabel} conventions to enforce. Treat this as an invention zone and verify against nearby code manually.`;
+    }
+
+    return {
+      file: filePath,
+      kind,
+      reason,
+      conventionsFound: conventions.length,
+      highestConfidence,
+      exemplarFile,
+      message,
+    };
+  }
+
   private buildSummary(
     filePaths: string[],
     checkedNodes: number,
     checkedRules: number,
     violationCount: number,
     pendingCount: number = 0,
+    evidenceGapCount: number = 0,
+    source: ValidationSummary['source'] = 'explicit_files',
   ): ValidationSummary {
     let message: string;
     if (violationCount > 0) {
       message = `Checked ${filePaths.length} file(s) against ${checkedRules} high-confidence rule(s); found ${violationCount} violation(s).`;
     } else if (pendingCount > 0) {
       message = `Checked ${filePaths.length} file(s) against ${checkedRules} high-confidence rule(s); no failures, ${pendingCount} pending graph-dependent check(s).`;
+    } else if (evidenceGapCount > 0) {
+      message = `Checked ${filePaths.length} file(s) against ${checkedRules} high-confidence rule(s); no failures, but ${evidenceGapCount} file/kind(s) lacked enforceable pattern evidence.`;
     } else {
       message = `Checked ${filePaths.length} file(s) against ${checkedRules} high-confidence rule(s); all pass.`;
+    }
+
+    if (evidenceGapCount > 0 && (violationCount > 0 || pendingCount > 0)) {
+      message += ` ${evidenceGapCount} file/kind(s) also lacked enforceable pattern evidence.`;
     }
 
     return {
@@ -255,6 +365,8 @@ export class ConventionValidator {
       checkedNodes,
       checkedRules,
       violations: violationCount,
+      evidenceGaps: evidenceGapCount,
+      source,
       message,
     };
   }

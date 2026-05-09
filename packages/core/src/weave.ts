@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, dirname, extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -12,7 +13,7 @@ import { PluginRunner } from './plugins/runner.js';
 import { ConventionEngine } from './conventions/engine.js';
 import { ConventionValidator } from './conventions/validator.js';
 import { FileWatcher } from './cache/watcher.js';
-import { toProjectRelative } from './path-utils.js';
+import { isTestFilePath, toProjectRelative } from './path-utils.js';
 import type {
   WeaveConfig,
   WeaveNode,
@@ -42,6 +43,7 @@ import type {
   ContextReason,
   ValidationViolation,
   ValidationResult,
+  ValidationSummary,
   Convention,
   ConventionPlugin,
   WeaveStatus,
@@ -67,6 +69,14 @@ interface ExemplarOptions {
   subKind?: string;
 }
 
+interface ValidationOptions {
+  fromSpec?: string;
+  fromSpecText?: string;
+  changedOnly?: boolean;
+  stagedOnly?: boolean;
+  includeSpecCoverage?: boolean;
+}
+
 interface PlannedFileExemplarCandidate {
   nodeId: number;
   file: string;
@@ -85,6 +95,7 @@ interface IndexerFingerprint {
 }
 
 const INDEXER_FINGERPRINT_VERSION = 2;
+const PLANNED_EXEMPLAR_CONFIDENCE_FLOOR = 0.6;
 
 /**
  * Main orchestrator. Wires together the graph store, parser, plugin system,
@@ -246,6 +257,7 @@ export class Weave {
           edge.relationship,
           reason ?? 'unresolved_edge',
           details,
+          this.classifyUnresolvedL2Edge(edge, details),
         );
         continue;
       }
@@ -278,6 +290,7 @@ export class Weave {
     const sourceSymbol = meta.sourceSymbol as string | undefined;
     const targetSymbol = meta.targetSymbol as string | undefined;
     const importedSymbol = meta.importedSymbol as string | undefined;
+    const moduleSpecifier = meta.moduleSpecifier as string | undefined;
     const importedNames = Array.isArray(meta.importedNames)
       ? meta.importedNames.filter((value): value is string => typeof value === 'string')
       : [];
@@ -323,6 +336,7 @@ export class Weave {
           targetSymbol: targetSymbol ?? null,
           importedSymbol: importedSymbol ?? null,
           importedNames,
+          moduleSpecifier: moduleSpecifier ?? null,
           sourceFile: sourceFile ?? null,
         },
       };
@@ -343,7 +357,9 @@ export class Weave {
   ): boolean {
     if (edge.relationship === 'imports') {
       const imported = String(details?.importedSymbol ?? '');
-      return imported.length > 0 && this.isExternalImportSymbol(imported);
+      const moduleSpecifier = String(details?.moduleSpecifier ?? '');
+      return (imported.length > 0 && this.isExternalImportSymbol(imported))
+        || this.isExternalModuleSpecifier(moduleSpecifier);
     }
 
     if (edge.relationship !== 'calls') {
@@ -364,13 +380,68 @@ export class Weave {
     if (target.includes('().') || target.includes('::factory')) {
       return true;
     }
+    if (this.callTargetImportedFromExternalModule(target, String(details?.sourceFile ?? ''))) {
+      return true;
+    }
 
     return this.isKnownExternalCall(target);
+  }
+
+  private classifyUnresolvedL2Edge(
+    edge: Partial<WeaveEdge>,
+    details?: Record<string, unknown>,
+  ): 'external_dependency' | 'internal_unresolved' | 'unknown' {
+    if (!details) {
+      return 'unknown';
+    }
+
+    if (edge.relationship === 'imports') {
+      const moduleSpecifier = String(details.moduleSpecifier ?? '');
+      const importedSymbol = String(details.importedSymbol ?? '');
+      if (this.isExternalModuleSpecifier(moduleSpecifier) || this.isExternalImportSymbol(importedSymbol)) {
+        return 'external_dependency';
+      }
+      return 'internal_unresolved';
+    }
+
+    if (edge.relationship === 'calls') {
+      const target = String(details.targetSymbol ?? details.importedSymbol ?? '');
+      if (!target) {
+        return 'unknown';
+      }
+      if (
+        this.isKnownExternalCall(target)
+        || (target.includes('.') && !target.includes('::'))
+        || this.callTargetImportedFromExternalModule(target, String(details.sourceFile ?? ''))
+      ) {
+        return 'external_dependency';
+      }
+      if (!target.includes('::') && !target.includes('\\') && /^[a-z_$]/.test(target)) {
+        return 'unknown';
+      }
+      return 'internal_unresolved';
+    }
+
+    const targetSymbol = String(details.targetSymbol ?? details.importedSymbol ?? '');
+    if (this.isExternalImportSymbol(targetSymbol)) {
+      return 'external_dependency';
+    }
+    return 'internal_unresolved';
   }
 
   private isExternalImportSymbol(symbol: string): boolean {
     if (symbol.startsWith('.')) {
       return false;
+    }
+
+    if (/^(?:App|Src)\\/.test(symbol)) {
+      return false;
+    }
+    if (symbol.includes('\\') && !/^(?:App|Src)\\/.test(symbol)) {
+      return true;
+    }
+    if (this.isKnownExternalClassSymbol(symbol)) {
+      return true;
     }
 
     return [
@@ -388,7 +459,26 @@ export class Weave {
     ].some(prefix => symbol.startsWith(prefix));
   }
 
+  private isExternalModuleSpecifier(moduleSpecifier: string): boolean {
+    if (!moduleSpecifier) {
+      return false;
+    }
+    return !moduleSpecifier.startsWith('.')
+      && !moduleSpecifier.startsWith('/')
+      && !moduleSpecifier.startsWith('@/')
+      && !moduleSpecifier.startsWith('~/');
+  }
+
   private isKnownExternalCall(symbol: string): boolean {
+    if (/^(?:app|collect)\s*\(/.test(symbol)) {
+      return true;
+    }
+
+    const staticOwner = symbol.includes('::') ? this.getShortSymbolName(symbol.split('::')[0] ?? '') : '';
+    if (staticOwner && this.isKnownExternalStaticOwner(staticOwner)) {
+      return true;
+    }
+
     const normalized = symbol
       .replace(/\(.*\)/, '')
       .split('::')
@@ -403,12 +493,15 @@ export class Weave {
       'array_map',
       'array_merge',
       'array_values',
+      'array_key_exists',
+      'app',
       'assertsent',
       'auth',
       'back',
       'boolean',
       'cancelframe',
       'cancelanimationframe',
+      'clearinterval',
       'cache',
       'cleartimeout',
       'collect',
@@ -426,14 +519,26 @@ export class Weave {
       'file_get_contents',
       'filled',
       'float',
+      'fract',
+      'in_array',
       'isset',
+      'is_array',
       'json_decode',
       'json_encode',
+      'strlen',
+      'strtolower',
+      'strtoupper',
+      'substr',
+      'preg_match',
+      'preg_replace',
       'markraw',
       'nexttick',
       'number',
       'now',
+      'onmounted',
+      'onunmounted',
       'put',
+      'resolve',
       'requestanimationframe',
       'redirect',
       'ref',
@@ -444,11 +549,131 @@ export class Weave {
       'setinterval',
       'setup',
       'settimeout',
+      'sin',
+      'string',
+      'tovalue',
+      'ucfirst',
+      'uniform',
       'url',
+      'vec2',
+      'vec3',
       'view',
       'watch',
       '__',
     ]).has(normalized);
+  }
+
+  private isKnownExternalStaticOwner(symbol: string): boolean {
+    return new Set([
+      'Artisan',
+      'Auth',
+      'Bus',
+      'Cache',
+      'DB',
+      'Event',
+      'File',
+      'Gate',
+      'Google2FA',
+      'Hash',
+      'Http',
+      'Inertia',
+      'Limit',
+      'Log',
+      'Mail',
+      'Notification',
+      'Mockery',
+      'UploadedFile',
+      'Password',
+      'Process',
+      'Queue',
+      'RateLimiter',
+      'Route',
+      'Rule',
+      'Schema',
+      'Socialite',
+      'Storage',
+      'Str',
+      'URL',
+      'Validator',
+      'parent',
+    ]).has(symbol);
+  }
+
+  private callTargetImportedFromExternalModule(target: string, sourceFile: string): boolean {
+    if (!sourceFile) {
+      return false;
+    }
+    const callName = this.getShortSymbolName(target.split('::').pop() ?? target)
+      .split('.')
+      .pop()
+      ?? target;
+    const relativeFile = this.toRelativePath(sourceFile);
+    const source = this.readProjectTextFile(relativeFile);
+    if (!source) {
+      return false;
+    }
+    const importRegex = /import\s+([^'";]+?)\s+from\s+['"]([^'"]+)['"]/g;
+    for (const match of source.matchAll(importRegex)) {
+      const clause = match[1]?.trim() ?? '';
+      const moduleSpecifier = match[2]?.trim() ?? '';
+      if (!this.isExternalModuleSpecifier(moduleSpecifier)) {
+        continue;
+      }
+      if (this.importClauseContainsSymbol(clause, callName)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private importClauseContainsSymbol(clause: string, symbolName: string): boolean {
+    const defaultPart = clause.split(',')[0]?.trim();
+    if (defaultPart === symbolName) {
+      return true;
+    }
+    const namespaceMatch = clause.match(/\*\s+as\s+([A-Za-z_$][\w$]*)/);
+    if (namespaceMatch?.[1] === symbolName) {
+      return true;
+    }
+    const namedMatch = clause.match(/\{([^}]+)\}/);
+    if (!namedMatch) {
+      return false;
+    }
+    return namedMatch[1]
+      .split(',')
+      .map(part => part.trim())
+      .filter(Boolean)
+      .some(part => {
+        const local = part.match(/\bas\s+([A-Za-z_$][\w$]*)$/)?.[1] ?? part;
+        return local.trim() === symbolName;
+      });
+  }
+
+  private isKnownExternalClassSymbol(symbol: string): boolean {
+    const short = this.getShortSymbolName(symbol);
+    return new Set([
+      'ActionRequest',
+      'Authenticatable',
+      'BaseTestCase',
+      'Blueprint',
+      'Closure',
+      'Command',
+      'Exception',
+      'Factory',
+      'FormRequest',
+      'LengthAwarePaginator',
+      'Mailable',
+      'Migration',
+      'Middleware',
+      'Model',
+      'RedirectResponse',
+      'Request',
+      'Response',
+      'Seeder',
+      'ServiceProvider',
+      'TelescopeApplicationServiceProvider',
+      'Throwable',
+    ]).has(short);
   }
 
   /**
@@ -482,7 +707,30 @@ export class Weave {
       if (shortNodes.length > 0) return shortNodes[0].id;
     }
 
+    const scopedOwner = this.scopedCallOwner(symbolName);
+    if (scopedOwner && !this.isKnownExternalStaticOwner(scopedOwner)) {
+      const localOwner = localNodes.get(scopedOwner);
+      if (localOwner) return localOwner.id;
+
+      const ownerNodes = this.compatibleSymbolNodes(
+        this.store.findNodeBySymbol(scopedOwner),
+        sourceLanguage,
+      );
+      if (ownerNodes.length > 0) return ownerNodes[0].id;
+    }
+
     return undefined;
+  }
+
+  private scopedCallOwner(symbolName: string): string | null {
+    if (!symbolName.includes('::')) {
+      return null;
+    }
+    const owner = symbolName.split('::')[0];
+    if (!owner) {
+      return null;
+    }
+    return this.getShortSymbolName(owner);
   }
 
   private compatibleSymbolNodes(nodes: WeaveNode[], sourceLanguage?: string): WeaveNode[] {
@@ -543,7 +791,10 @@ export class Weave {
     const taskProfile = (query.scope || specContext)
       ? this.buildTaskProfile(query.scope ?? query.start, specContext)
       : undefined;
-    return this.buildContextBundle([query.start], query, taskProfile);
+    return this.buildContextBundle([query.start], query, taskProfile, {
+      includeSpecContextEntries: false,
+      includeSpecExistingStarts: false,
+    });
   }
 
   /**
@@ -674,8 +925,22 @@ export class Weave {
     return this.validator.validate(filePaths);
   }
 
-  validateWithSummary(filePaths: string[]): ValidationResult {
-    return this.validator.validateWithSummary(filePaths);
+  validateWithSummary(filePaths: string[] = [], options: ValidationOptions = {}): ValidationResult {
+    const target = this.validationTargets(filePaths, options);
+    const result = this.validator.validateWithSummary(target.files, target.source);
+    const specContext = (options.includeSpecCoverage || options.fromSpecText || options.fromSpec) && (options.fromSpecText || options.fromSpec)
+      ? this.buildSpecContext(options.fromSpecText ?? options.fromSpec as string)
+      : null;
+    const resultWithWorktree = target.worktree
+      ? { ...result, worktree: target.worktree }
+      : result;
+    if (!specContext) {
+      return resultWithWorktree;
+    }
+    return {
+      ...resultWithWorktree,
+      specCoverage: this.buildValidationSpecCoverage(target.files, specContext),
+    };
   }
 
   /** Get the best exemplar for a node kind. */
@@ -701,23 +966,46 @@ export class Weave {
   /** Blast radius: what would be affected by changing a symbol. */
   impact(fileOrSymbol: string, options: SubgraphQuery['options'] = {}): SubgraphResult {
     const impactOptions = this.withAutoImpactSummary(fileOrSymbol, options);
-    const result = this.subgraph.impact(fileOrSymbol, impactOptions);
-    const specContext = impactOptions.includeSpecContext === false
-      ? null
-      : this.specContextForFollowUp({
-          start: fileOrSymbol,
-          task: impactOptions.task,
-          scope: impactOptions.scope,
-          fromSpec: impactOptions.fromSpec,
-          fromSpecText: impactOptions.fromSpecText,
-        });
+    const preSummary = impactOptions.summary === true && options.summary === undefined;
+    let result = this.subgraph.impact(fileOrSymbol, impactOptions);
+    if (preSummary) {
+      result = this.markAutoSummarizedImpact(
+        result,
+        'Direct graph fanout exceeded the default full-impact threshold.',
+      );
+    } else if (this.shouldFailSoftToImpactSummary(result, options)) {
+      result = this.markAutoSummarizedImpact(
+        this.subgraph.impact(fileOrSymbol, { ...impactOptions, summary: true }),
+        'Full impact result exceeded the default response budget; reran in summary mode.',
+      );
+    }
+    const specContext = this.specContextForFollowUp({
+      start: fileOrSymbol,
+      task: impactOptions.task,
+      scope: impactOptions.scope,
+      fromSpec: impactOptions.fromSpec,
+      fromSpecText: impactOptions.fromSpecText,
+    });
     if (!specContext) {
       return result;
     }
 
+    const querySpecContext = impactOptions.includeSpecContext === false
+      ? undefined
+      : this.buildQuerySpecContext(
+          specContext,
+          this.toRelativePath(fileOrSymbol),
+          impactOptions.task ?? impactOptions.scope ?? fileOrSymbol,
+        );
     return {
       ...result,
-      specContext: this.buildQuerySpecContext(specContext, this.toRelativePath(fileOrSymbol), impactOptions.task ?? impactOptions.scope ?? fileOrSymbol),
+      impact: result.impact
+        ? {
+            ...result.impact,
+            specTouchpoints: this.specTouchpointsForImpact(result.impact, specContext),
+          }
+        : result.impact,
+      ...(querySpecContext ? { specContext: querySpecContext } : {}),
     };
   }
 
@@ -810,6 +1098,49 @@ export class Weave {
     };
   }
 
+  private shouldFailSoftToImpactSummary(
+    result: SubgraphResult,
+    requestedOptions: SubgraphOptions,
+  ): boolean {
+    if (
+      requestedOptions.summary !== undefined
+      || requestedOptions.maxTokens !== undefined
+      || requestedOptions.maxNodes !== undefined
+      || requestedOptions.maxEdges !== undefined
+      || !result.impact
+    ) {
+      return false;
+    }
+
+    const counts = result.impact.counts;
+    const estimatedChars = JSON.stringify(result).length;
+    return estimatedChars > 24_000
+      || counts.crossFileNodes > 30
+      || counts.crossFileEdges > 50
+      || counts.intraFileEdges > 80;
+  }
+
+  private markAutoSummarizedImpact(result: SubgraphResult, reason: string): SubgraphResult {
+    if (!result.impact) {
+      return result;
+    }
+
+    return {
+      ...result,
+      impact: {
+        ...result.impact,
+        budget: {
+          ...result.impact.budget,
+          summary: true,
+          autoSummarized: true,
+          autoSummaryReason: reason,
+          maxNodes: result.impact.budget?.maxNodes ?? result.nodes.length,
+          maxEdges: result.impact.budget?.maxEdges ?? result.edges.length,
+        },
+      },
+    };
+  }
+
   private inferSpecInputFromFollowUpQuery(query: Pick<SubgraphQuery, 'start' | 'task' | 'scope'>): string | null {
     if (this.isMarkdownSpecPath(query.start) && this.readProjectTextFile(this.toRelativePath(query.start)) !== null) {
       return query.start;
@@ -889,6 +1220,236 @@ export class Weave {
           directExemplarFile: pattern.directExemplarFile,
           confidence: pattern.confidence,
       })),
+    };
+  }
+
+  private specTouchpointsForImpact(
+    impact: NonNullable<SubgraphResult['impact']>,
+    specContext: BootstrapSpecContext,
+  ): NonNullable<NonNullable<SubgraphResult['impact']>['specTouchpoints']> {
+    const targetFiles = new Set(impact.targetFiles);
+    const impactedFiles = new Set([
+      ...impact.targetFiles,
+      ...impact.crossFileNodes.map(node => node.file),
+    ]);
+    const seen = new Set<string>();
+    const touchpoints: NonNullable<NonNullable<SubgraphResult['impact']>['specTouchpoints']> = [];
+
+    for (const reference of specContext.lineReferences ?? []) {
+      const key = `${reference.file}:${reference.lineStart}:${reference.lineEnd ?? reference.lineStart}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      const status = targetFiles.has(reference.file)
+        ? 'target'
+        : impactedFiles.has(reference.file)
+          ? 'impacted'
+          : 'spec_related_not_impacted';
+      touchpoints.push({
+        file: reference.file,
+        status,
+        reason: status === 'target'
+          ? 'Spec line anchor is inside the impact target.'
+          : status === 'impacted'
+            ? 'Spec line anchor is also connected by current graph impact edges.'
+            : 'Spec line anchor is related by the spec but has no current graph impact edge from this target.',
+        lineStart: reference.lineStart,
+        ...(reference.lineEnd ? { lineEnd: reference.lineEnd } : {}),
+      });
+    }
+
+    return touchpoints.slice(0, 16);
+  }
+
+  private buildValidationSpecCoverage(
+    filePaths: string[],
+    specContext: BootstrapSpecContext,
+  ): NonNullable<ValidationResult['specCoverage']> {
+    const checkedFiles = Array.from(new Set(filePaths.map(file => this.toRelativePath(file)))).sort();
+    const checkedSet = new Set(checkedFiles);
+    const expectedFiles = Array.from(new Set([
+      ...specContext.existingFiles,
+      ...(specContext.plannedFiles ?? specContext.likelyNewFiles),
+    ])).sort();
+    const checkedExpectedFiles = expectedFiles.filter(file => checkedSet.has(file));
+    const uncheckedExpectedFiles = expectedFiles.filter(file => !checkedSet.has(file));
+    const missingExpectedFiles = expectedFiles.filter(file => !existsSync(join(this.projectRoot, file)));
+    const missingUnchecked = missingExpectedFiles.filter(file => !checkedSet.has(file));
+    const message = uncheckedExpectedFiles.length === 0 && missingExpectedFiles.length === 0
+      ? `Validated all ${expectedFiles.length} spec-referenced files.`
+      : `Validated ${checkedExpectedFiles.length}/${expectedFiles.length} spec-referenced files; ${uncheckedExpectedFiles.length} unchecked, ${missingExpectedFiles.length} missing on disk.`
+        + (missingUnchecked.length > 0 ? ' Create missing planned files before treating validation as complete.' : '');
+
+    return {
+      file: specContext.file,
+      checkedFiles,
+      expectedFiles,
+      checkedExpectedFiles,
+      uncheckedExpectedFiles,
+      missingExpectedFiles,
+      message,
+    };
+  }
+
+  private validationTargets(
+    filePaths: string[],
+    options: ValidationOptions,
+  ): {
+    files: string[];
+    source: NonNullable<ValidationSummary['source']>;
+    worktree?: NonNullable<ValidationResult['worktree']>;
+  } {
+    if (!options.changedOnly && !options.stagedOnly && filePaths.length > 0) {
+      const files = Array.from(new Set(filePaths.map(file => this.toRelativePath(file)))).sort();
+      return { files, source: 'explicit_files' };
+    }
+
+    const worktree = options.stagedOnly
+      ? this.gitStagedValidationTargets()
+      : this.gitUncommittedValidationTargets();
+    return {
+      files: worktree.checkedFiles,
+      source: worktree.source,
+      worktree,
+    };
+  }
+
+  private gitStagedValidationTargets(): NonNullable<ValidationResult['worktree']> {
+    let output = '';
+    try {
+      output = execFileSync('git', [
+        'diff',
+        '--cached',
+        '--name-status',
+        '--diff-filter=ACMRD',
+      ], {
+        cwd: this.projectRoot,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+    } catch {
+      return {
+        source: 'git_staged',
+        checkedFiles: [],
+        changedFiles: [],
+        deletedFiles: [],
+        unavailableReason: 'git diff --cached failed; project may not be a git worktree',
+        message: 'No files validated because staged git changes were unavailable. Pass files explicitly to validate codebase patterns without git worktree detection.',
+      };
+    }
+
+    return this.gitValidationTargetsFromNameStatus(output, 'git_staged', {
+      changedMessage: count => `Validating ${count} staged git file(s) against mined codebase patterns.`,
+      emptyMessage: 'No staged git files found to validate. Pass files explicitly or omit stagedOnly to validate uncommitted files.',
+    });
+  }
+
+  private gitUncommittedValidationTargets(): NonNullable<ValidationResult['worktree']> {
+    let output = '';
+    try {
+      output = execFileSync('git', [
+        'status',
+        '--porcelain=v1',
+        '--untracked-files=all',
+      ], {
+        cwd: this.projectRoot,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+    } catch {
+      return {
+        source: 'git_uncommitted',
+        checkedFiles: [],
+        changedFiles: [],
+        deletedFiles: [],
+        unavailableReason: 'git status failed; project may not be a git worktree',
+        message: 'No files validated because git status was unavailable. Pass files explicitly to validate codebase patterns without git worktree detection.',
+      };
+    }
+
+    return this.gitValidationTargetsFromPorcelain(output);
+  }
+
+  private gitValidationTargetsFromPorcelain(output: string): NonNullable<ValidationResult['worktree']> {
+    const changedFiles: string[] = [];
+    const deletedFiles: string[] = [];
+    for (const rawLine of output.split('\n')) {
+      if (!rawLine.trim()) {
+        continue;
+      }
+      const status = rawLine.slice(0, 2);
+      let file = rawLine.slice(3).trim();
+      if (file.includes(' -> ')) {
+        file = file.split(' -> ').pop() ?? file;
+      }
+      file = this.toRelativePath(file.replace(/^"|"$/g, ''));
+      if (!file || this.isGeneratedPath(file)) {
+        continue;
+      }
+      if (status.includes('D') && !existsSync(join(this.projectRoot, file))) {
+        deletedFiles.push(file);
+      } else {
+        changedFiles.push(file);
+      }
+    }
+
+    const checkedFiles = Array.from(new Set(changedFiles))
+      .filter(file => existsSync(join(this.projectRoot, file)))
+      .sort();
+    const uniqueChangedFiles = Array.from(new Set(changedFiles)).sort();
+    const uniqueDeletedFiles = Array.from(new Set(deletedFiles)).sort();
+    return {
+      source: 'git_uncommitted',
+      checkedFiles,
+      changedFiles: uniqueChangedFiles,
+      deletedFiles: uniqueDeletedFiles,
+      message: checkedFiles.length > 0
+        ? `Validating ${checkedFiles.length} uncommitted git file(s) against mined codebase patterns.`
+        : 'No uncommitted git files found to validate. Pass files explicitly to validate a specific change set.',
+    };
+  }
+
+  private gitValidationTargetsFromNameStatus(
+    output: string,
+    source: 'git_staged',
+    messages: {
+      changedMessage: (count: number) => string;
+      emptyMessage: string;
+    },
+  ): NonNullable<ValidationResult['worktree']> {
+    const changedFiles: string[] = [];
+    const deletedFiles: string[] = [];
+    for (const rawLine of output.split('\n')) {
+      if (!rawLine.trim()) {
+        continue;
+      }
+      const [status, ...pathParts] = rawLine.split('\t');
+      let file = pathParts[pathParts.length - 1] ?? '';
+      file = this.toRelativePath(file.replace(/^"|"$/g, ''));
+      if (!file || this.isGeneratedPath(file)) {
+        continue;
+      }
+      if (status.includes('D') && !existsSync(join(this.projectRoot, file))) {
+        deletedFiles.push(file);
+      } else {
+        changedFiles.push(file);
+      }
+    }
+
+    const checkedFiles = Array.from(new Set(changedFiles))
+      .filter(file => existsSync(join(this.projectRoot, file)))
+      .sort();
+    const uniqueChangedFiles = Array.from(new Set(changedFiles)).sort();
+    const uniqueDeletedFiles = Array.from(new Set(deletedFiles)).sort();
+    return {
+      source,
+      checkedFiles,
+      changedFiles: uniqueChangedFiles,
+      deletedFiles: uniqueDeletedFiles,
+      message: checkedFiles.length > 0
+        ? messages.changedMessage(checkedFiles.length)
+        : messages.emptyMessage,
     };
   }
 
@@ -1099,6 +1660,9 @@ export class Weave {
         metadataUpdates: files.reduce((sum, file) => sum + file.metadataUpdates, 0),
         queryErrors: files.reduce((sum, file) => sum + file.queryErrors, 0),
         issues: issues.length,
+        externalIssues: issues.filter(issue => issue.classification === 'external_dependency').length,
+        internalIssues: issues.filter(issue => issue.classification === 'internal_unresolved').length,
+        unknownIssues: issues.filter(issue => !issue.classification || issue.classification === 'unknown').length,
       },
     };
   }
@@ -1179,10 +1743,17 @@ export class Weave {
     starts: string[],
     query: ContextBundleQuery,
     taskProfile?: TaskProfile,
+    options: {
+      includeSpecContextEntries?: boolean;
+      includeSpecExistingStarts?: boolean;
+    } = {
+      includeSpecContextEntries: true,
+      includeSpecExistingStarts: true,
+    },
   ): ContextBundle {
     const normalizedStarts = starts.map(start => this.toRelativePath(start));
-    const result = this.extractCombinedSubgraph(normalizedStarts, query, taskProfile);
-    const workingSet = this.buildWorkingSet(result, normalizedStarts, query, taskProfile);
+    const result = this.extractCombinedSubgraph(normalizedStarts, query, taskProfile, options);
+    const workingSet = this.buildWorkingSet(result, normalizedStarts, query, taskProfile, options);
 
     return {
       workingSet,
@@ -1195,10 +1766,11 @@ export class Weave {
     starts: string[],
     query: Pick<ContextBundleQuery, 'scope' | 'depth'>,
     taskProfile?: TaskProfile,
+    options: { includeSpecExistingStarts?: boolean } = { includeSpecExistingStarts: true },
   ): SubgraphResult {
     const nodeMap = new Map<number, SubgraphNode>();
     const edgeMap = new Map<string, SubgraphEdge>();
-    const traversalStarts = taskProfile?.specContext
+    const traversalStarts = taskProfile?.specContext && options.includeSpecExistingStarts !== false
       ? Array.from(new Set([...starts, ...taskProfile.specContext.existingFiles]))
       : starts;
 
@@ -1246,6 +1818,7 @@ export class Weave {
     starts: string[],
     query: Pick<ContextBundleQuery, 'maxFiles'>,
     taskProfile?: TaskProfile,
+    options: { includeSpecContextEntries?: boolean } = { includeSpecContextEntries: true },
   ): ContextFile[] {
     const startSet = new Set(starts.map(start => this.toRelativePath(start)));
     const primaryStart = starts[0] ? this.toRelativePath(starts[0]) : null;
@@ -1326,7 +1899,9 @@ export class Weave {
       for (const entry of fileEntries.values()) {
         entry.score += this.contextFileTaskBonus(entry.file, taskProfile);
       }
-      this.addSpecContextFiles(fileEntries, taskProfile);
+      if (options.includeSpecContextEntries !== false) {
+        this.addSpecContextFiles(fileEntries, taskProfile);
+      }
       this.addEndpointLiteralContextFiles(fileEntries, taskProfile);
       this.addFrontendImplementationContextFiles(fileEntries, taskProfile, primaryStart);
       this.addHeuristicContextFiles(fileEntries, taskProfile, primaryStart);
@@ -1560,13 +2135,12 @@ export class Weave {
     specContext: BootstrapSpecContext | null,
     maxExemplars: number,
   ): ContextExemplar[] {
-    if (!specContext?.likelyNewFileExemplars?.length) {
+    if (!specContext) {
       return [];
     }
 
-    return specContext.likelyNewFileExemplars
+    const plannedExemplars = (specContext.likelyNewFileExemplars ?? [])
       .filter(exemplar => exemplar.exemplarFile !== null)
-      .slice(0, maxExemplars)
       .map(exemplar => ({
         kind: exemplar.kind ?? 'unknown',
         file: exemplar.exemplarFile as string,
@@ -1578,6 +2152,54 @@ export class Weave {
         shapeMatchConfidence: exemplar.shapeMatchConfidence,
         nodeId: exemplar.exemplarNodeId ?? 0,
       }));
+
+    const testExemplar = this.specImpliedTestContextExemplar(specContext, plannedExemplars);
+    return [
+      ...plannedExemplars,
+      ...(testExemplar ? [testExemplar] : []),
+    ].slice(0, maxExemplars);
+  }
+
+  private specImpliedTestContextExemplar(
+    specContext: BootstrapSpecContext,
+    existingExemplars: ContextExemplar[],
+  ): ContextExemplar | null {
+    if (!this.specContextMentionsTests(specContext)) {
+      return null;
+    }
+    if (existingExemplars.some(exemplar => this.normalizeKindAlias(exemplar.kind) === 'test')) {
+      return null;
+    }
+
+    const exemplar = this.exemplar('test');
+    if (!exemplar) {
+      return null;
+    }
+
+    return {
+      kind: 'test',
+      file: exemplar.file,
+      reason: `Spec mentions tests; use this existing test as a pattern. ${exemplar.reason}`,
+      provenance: 'structural_similarity',
+      confidence: Math.min(0.8, this.kindConventionConfidence('test')),
+      nodeId: exemplar.nodeId,
+    };
+  }
+
+  private specContextMentionsTests(specContext: BootstrapSpecContext): boolean {
+    if (specContext.mentionsTests) {
+      return true;
+    }
+    const terms = new Set([
+      ...(specContext.termIndex ?? []),
+      ...(specContext.terms ?? []),
+    ].map(term => term.toLowerCase()));
+    return ['test', 'tests', 'testing', 'spec', 'specs', 'phpunit', 'pest', 'coverage', 'assert']
+      .some(term => terms.has(term));
+  }
+
+  private specTextMentionsTests(content: string): boolean {
+    return /\b(?:tests?|testing|specs?|phpunit|pest|coverage|assert(?:ion|ions)?)\b/i.test(content);
   }
 
   private collectPeerPrecedentExemplars(
@@ -1906,11 +2528,96 @@ export class Weave {
       return this.getComponentExemplarForShape(options.subKind);
     }
 
+    if (kind === 'inertia_page' && options.subKind) {
+      return this.getInertiaPageExemplarForShape(options.subKind);
+    }
+
     if ((kind === 'component' || kind === 'inertia_page') && contextNodeId !== undefined) {
       return this.getContextualExemplar(kind, contextNodeId, options);
     }
 
+    if (kind === 'service') {
+      return this.getServiceExemplarFallback();
+    }
+
     return null;
+  }
+
+  private getServiceExemplarFallback(): { nodeId: number; file: string; reason: string } | null {
+    const scored = this.store.getNodesByKind('service')
+      .filter(node => !this.isGeneratedPath(node.filePath))
+      .map(node => {
+        const source = this.readProjectTextFile(node.filePath) ?? '';
+        let score = 10;
+        if (/^(?:app|src)\/Services\//i.test(node.filePath)) score += 24;
+        if (/^(?:app|src)\/Clients\//i.test(node.filePath)) score += 12;
+        if (/\b(config|Cache::|Storage::|Http::|fetch|axios|validate|resolve|registry|lookup)\b/i.test(source)) score += 8;
+        if ((node.lineEnd - node.lineStart) <= 220) score += 4;
+        return { node, score };
+      })
+      .sort((a, b) => b.score - a.score || a.node.filePath.localeCompare(b.node.filePath));
+
+    const best = scored[0];
+    if (!best) {
+      return null;
+    }
+    return {
+      nodeId: best.node.id,
+      file: best.node.filePath,
+      reason: 'Best indexed service-shaped exemplar; verify role fit before copying because service conventions may be sparse.',
+    };
+  }
+
+  private getInertiaPageExemplarForShape(
+    subKind: string,
+  ): { nodeId: number; file: string; reason: string } | null {
+    const normalizedSubKind = subKind.toLowerCase();
+    const scored = this.store.getNodesByKind('inertia_page')
+      .filter(node => !this.isGeneratedPath(node.filePath))
+      .map(node => ({
+        node,
+        score: this.inertiaPageShapeScore(node, normalizedSubKind),
+      }))
+      .filter(candidate => candidate.score > 0)
+      .sort((a, b) => b.score - a.score || a.node.filePath.localeCompare(b.node.filePath));
+
+    const best = scored[0];
+    if (!best) {
+      return null;
+    }
+
+    return {
+      nodeId: best.node.id,
+      file: best.node.filePath,
+      reason: `Best ${subKind} inertia_page exemplar by page path and source shape`,
+    };
+  }
+
+  private inertiaPageShapeScore(node: WeaveNode, subKind: string): number {
+    const file = node.filePath;
+    const identifier = `${node.symbolName} ${file}`;
+    const source = this.readProjectTextFile(file) ?? '';
+    let score = 0;
+
+    if (this.identifierContainsSubKind(identifier, subKind)) {
+      score += 40;
+    }
+
+    if (subKind === 'index' || subKind === 'list') {
+      if (/\/(?:Index|List)\.vue$/i.test(file)) score += 34;
+      if (/\bv-for\b|<table\b|\bitems\b|\brows\b|\bfilters\b/i.test(source)) score += 18;
+      if (/\/(?:Show|Create|Edit)\.vue$/i.test(file)) score -= 28;
+    } else if (subKind === 'show' || subKind === 'detail') {
+      if (/\/Show\.vue$/i.test(file)) score += 34;
+      if (/\bdefineProps\b|<section\b|<article\b/i.test(source)) score += 10;
+      if (/\/(?:Index|List|Create|Edit)\.vue$/i.test(file)) score -= 20;
+    } else if (subKind === 'create' || subKind === 'edit' || subKind === 'form') {
+      if (/\/(?:Create|Edit|Form)\.vue$/i.test(file)) score += 34;
+      if (/\buseForm\b|<form\b|router\.(?:post|put|patch)\b/i.test(source)) score += 24;
+      if (/\/(?:Index|List|Show)\.vue$/i.test(file)) score -= 20;
+    }
+
+    return score;
   }
 
   private getContextualExemplar(
@@ -2271,6 +2978,7 @@ export class Weave {
     if (filePath.startsWith('database/migrations/')) return 'migration';
     if (filePath.startsWith('config/') && filePath.endsWith('.php')) return 'config_array';
     if (filePath.startsWith('app/Http/Requests/')) return 'form_request';
+    if (isTestFilePath(filePath)) return 'test';
     if (filePath.startsWith('resources/js/Pages/') && filePath.endsWith('.vue')) return 'inertia_page';
     if (filePath.startsWith('resources/js/Components/') && filePath.endsWith('.vue')) return 'component';
     if (filePath.startsWith('resources/js/composables/') && /\/use[A-Z].*\.(?:js|ts)$/.test(filePath)) return 'composable';
@@ -2292,6 +3000,7 @@ export class Weave {
       case 'config_array':
         return 95;
       case 'form_request':
+      case 'test':
         return 94;
       case 'policy':
         return 92;
@@ -2330,6 +3039,7 @@ export class Weave {
       case 'migration':
         return 97;
       case 'config_array':
+      case 'test':
         return 95;
       case 'composable':
         return 96;
@@ -2413,6 +3123,9 @@ export class Weave {
     }
     if (['request', 'form-request', 'form_request'].includes(normalized)) {
       return 'form_request';
+    }
+    if (['tests', 'test_file', 'spec_file'].includes(normalized)) {
+      return 'test';
     }
     return kind;
   }
@@ -2723,6 +3436,7 @@ export class Weave {
       plannedFilePatterns,
       suspiciousReferences: actionableSuspiciousReferences,
       novelPathPrefixes,
+      mentionsTests: this.specTextMentionsTests(content),
       terms,
     };
 
@@ -2914,6 +3628,20 @@ export class Weave {
 	          confidenceReason: 'No indexed shape exemplar was found; confidence reflects an evidence gap.',
 	        };
 	      }
+
+      if (exemplar.confidence < PLANNED_EXEMPLAR_CONFIDENCE_FLOOR) {
+        return {
+          file,
+          kind,
+          exemplarFile: null,
+          exemplarNodeId: null,
+          reason: `No reliable exemplar found for planned ${kind}; best candidate ${exemplar.file} scored below the confidence floor.`,
+          confidence: exemplar.confidence,
+          coMentionConfidence: exemplar.coMentionConfidence,
+          shapeMatchConfidence: exemplar.shapeMatchConfidence,
+          confidenceReason: `${exemplar.confidenceReason} Suppressed ${exemplar.file} because confidence ${exemplar.confidence.toFixed(2)} is below ${PLANNED_EXEMPLAR_CONFIDENCE_FLOOR.toFixed(2)}.`,
+        };
+      }
 
       return {
         file,
@@ -3349,9 +4077,36 @@ export class Weave {
       if (this.configSectionForFile(plannedFile) === this.configSectionForFile(candidate.filePath)) {
         shapeScore += 0.36;
       }
+    } else if (normalizedKind === 'test') {
+      if (this.testFamilyForFile(plannedFile) === this.testFamilyForFile(candidate.filePath)) {
+        shapeScore += 0.32;
+      }
+      if (this.testSubjectTokens(plannedFile).some(token => this.testSubjectTokens(candidate.filePath).includes(token))) {
+        shapeScore += 0.16;
+      }
     }
 
     return Math.max(0.05, Math.min(1, Number(shapeScore.toFixed(2))));
+  }
+
+  private testFamilyForFile(filePath: string): string {
+    const normalized = filePath.replace(/\\/g, '/').toLowerCase();
+    if (normalized.includes('/feature/')) return 'feature';
+    if (normalized.includes('/unit/')) return 'unit';
+    if (normalized.includes('/browser/')) return 'browser';
+    if (normalized.includes('/e2e/')) return 'e2e';
+    if (normalized.includes('/integration/')) return 'integration';
+    return normalized.startsWith('tests/') || normalized.startsWith('test/') ? 'test' : 'source-adjacent';
+  }
+
+  private testSubjectTokens(filePath: string): string[] {
+    return basename(filePath, extname(filePath))
+      .replace(/\.(?:test|spec)$/i, '')
+      .replace(/(?:Test|Spec)$/i, '')
+      .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .filter(token => token.length >= 3 && !['test', 'spec', 'feature', 'unit'].includes(token));
   }
 
   private composableShapeScore(node: WeaveNode, plannedFile: string): number {
@@ -4030,6 +4785,8 @@ export class Weave {
         return 86;
       case 'action':
         return 82;
+      case 'test':
+        return 81;
       case 'service':
         return 81;
       case 'config_array':
@@ -4175,8 +4932,10 @@ export class Weave {
       'change', 'fix', 'make', 'use', 'new', 'existing', 'line', 'text', 'copy',
       'short', 'small', 'real', 'task', 'build', 'create', 'implement', 'scaffold',
       'wire', 'wiring', 'feature', 'features', 'composable', 'composables', 'action', 'actions', 'route',
-	      'routes', 'api', 'endpoint', 'endpoints',
-	      'doc', 'docs', 'section', 'reference', 'possible', 'maybe', 'note',
+      'routes', 'api', 'endpoint', 'endpoints',
+      'doc', 'docs', 'section', 'reference', 'possible', 'maybe', 'note',
+      'another', 'other', 'others', 'their', 'them', 'then', 'there', 'these',
+      'those', 'thing', 'things', 'which', 'while',
 	    ]);
 
     return this.stripEndpointLiterals(task)
@@ -4479,7 +5238,7 @@ export class Weave {
     const candidates: BootstrapEntryCandidate[] = [];
     const seenFiles = new Set<string>();
 
-    for (const kind of ['action', 'inertia_page', 'model', 'migration', 'form_request', 'component', 'method', 'spec']) {
+    for (const kind of ['action', 'inertia_page', 'model', 'migration', 'form_request', 'test', 'component', 'method', 'spec']) {
       const nodes = this.store.getNodesByKind(kind)
         .filter(node => !this.isGeneratedPath(node.filePath))
         .filter(node => !this.isBootstrapNoisePath(node.filePath))
@@ -4955,6 +5714,7 @@ export class Weave {
     return [
       'action',
       'actions',
+      'another',
       'route',
       'routes',
       'api',
@@ -4972,17 +5732,29 @@ export class Weave {
       'member',
       'members',
       'scoped',
-	      'component',
-	      'components',
-	      'page',
-	      'pages',
-	      'doc',
-	      'docs',
-	      'section',
-	      'reference',
-	      'possible',
-	      'maybe',
-	      'note',
+      'component',
+      'components',
+      'page',
+      'pages',
+      'doc',
+      'docs',
+      'section',
+      'reference',
+      'possible',
+      'maybe',
+      'note',
+      'other',
+      'others',
+      'their',
+      'them',
+      'then',
+      'there',
+      'these',
+      'those',
+      'thing',
+      'things',
+      'which',
+      'while',
 	    ].includes(term);
 	  }
 
@@ -5266,6 +6038,20 @@ export class Weave {
       });
     }
 
+    const projectTestInstructionFiles = this.projectInstructionFilesMentioningTests();
+    if (
+      specContext
+      && !specContext.mentionsTests
+      && taskProfile.creationLike
+      && projectTestInstructionFiles.length > 0
+    ) {
+      warnings.push({
+        code: 'project_test_guidance',
+        message: 'Project instructions mention tests even though the spec does not; do not treat mentionsTests:false as permission to skip validation or test changes.',
+        files: projectTestInstructionFiles,
+      });
+    }
+
     const highFanoutFiles = workingSet
       .filter(file => this.isHighFanoutFile(file.file))
       .map(file => file.file);
@@ -5282,17 +6068,38 @@ export class Weave {
     if (issueCount > 0) {
       warnings.push({
         code: 'indexing_diagnostics_issues',
-        message: 'The index has unresolved extraction issues; high-level graph context is usable, but inspect weave_status before trusting missing edges as absence.',
+        message: 'The index has unresolved extraction issues; use internalIssues vs externalIssues to decide whether missing edges are likely project gaps or external dependency noise.',
         details: {
           issueCount,
           queryErrors: diagnostics.totals.queryErrors,
           l2EdgesSkipped: diagnostics.totals.l2EdgesSkipped,
           l3EdgesSkipped: diagnostics.totals.l3EdgesSkipped,
+          externalIssues: diagnostics.totals.externalIssues,
+          internalIssues: diagnostics.totals.internalIssues,
+          unknownIssues: diagnostics.totals.unknownIssues,
         },
       });
     }
 
     return warnings;
+  }
+
+  private projectInstructionFilesMentioningTests(): string[] {
+    const candidates = [
+      'AGENTS.md',
+      'CLAUDE.md',
+      'CONTRIBUTING.md',
+      'README.md',
+      '.cursor/rules',
+      '.github/copilot-instructions.md',
+    ];
+    return candidates.filter(file => {
+      const content = this.readProjectTextFile(file);
+      if (!content) {
+        return false;
+      }
+      return /\b(?:tests?|testing|phpunit|pest|vitest|pytest|rspec|jest|coverage)\b/i.test(content);
+    });
   }
 
   private plannedFileEvidenceGaps(specContext: BootstrapSpecContext): Array<{
@@ -5316,7 +6123,7 @@ export class Weave {
         issues.push('no kind inferred');
       }
       if (!exemplar.exemplarFile) {
-        issues.push('no indexed exemplar');
+        issues.push(exemplar.reason.startsWith('No reliable exemplar') ? 'no reliable exemplar' : 'no indexed exemplar');
       }
       if (exemplar.kind) {
         const conventions = this.conventionEngine
