@@ -507,7 +507,9 @@ export class Weave {
 
   /** Subgraph query: minimal connected context for a task. */
   query(query: SubgraphQuery): SubgraphResult {
-    const specContext = this.specContextForFollowUp(query);
+    const specContext = query.options?.includeSpecContext === false
+      ? null
+      : this.specContextForFollowUp(query);
     const result = this.subgraph.extract(query);
     const querySpecContext = specContext
       ? this.buildQuerySpecContext(specContext, this.queryFileReference(query), query.task ?? query.scope ?? query.start)
@@ -620,7 +622,7 @@ export class Weave {
       ? this.compactBootstrapContext(context, specContext)
       : context;
 
-    return {
+    const payload: BootstrapPayload = {
       task: query.task,
       start,
       startSource: query.start ? 'provided' : 'inferred',
@@ -647,6 +649,18 @@ export class Weave {
         compact,
       ),
     };
+
+    if (compact) {
+      // Keep payload.context available to in-process callers without paying for
+      // a second serialized copy next to the top-level aliases.
+      Object.defineProperty(payload, 'context', {
+        value: payloadContext,
+        enumerable: false,
+        configurable: true,
+      });
+    }
+
+    return payload;
   }
 
   /** Get derived conventions for a node kind. */
@@ -688,13 +702,15 @@ export class Weave {
   impact(fileOrSymbol: string, options: SubgraphQuery['options'] = {}): SubgraphResult {
     const impactOptions = this.withAutoImpactSummary(fileOrSymbol, options);
     const result = this.subgraph.impact(fileOrSymbol, impactOptions);
-    const specContext = this.specContextForFollowUp({
-      start: fileOrSymbol,
-      task: impactOptions.task,
-      scope: impactOptions.scope,
-      fromSpec: impactOptions.fromSpec,
-      fromSpecText: impactOptions.fromSpecText,
-    });
+    const specContext = impactOptions.includeSpecContext === false
+      ? null
+      : this.specContextForFollowUp({
+          start: fileOrSymbol,
+          task: impactOptions.task,
+          scope: impactOptions.scope,
+          fromSpec: impactOptions.fromSpec,
+          fromSpecText: impactOptions.fromSpecText,
+        });
     if (!specContext) {
       return result;
     }
@@ -2415,12 +2431,28 @@ export class Weave {
   ): ContextBundle {
     return {
       workingSet: context.workingSet.map(file => ({
-        ...file,
-        reasons: file.reasons.slice(0, 3),
-        anchors: file.anchors.slice(0, 2),
+        file: file.file,
+        kind: file.kind,
+        kinds: file.kinds,
+        confidence: file.confidence,
+        provenance: file.provenance,
+        reasons: file.reasons.slice(0, 2),
+        anchors: file.anchors.slice(0, 1),
       })),
       constraints: context.constraints.slice(0, 6),
-      exemplars: context.exemplars.slice(0, specContext?.likelyNewFileExemplars?.length ? 8 : 3),
+      exemplars: context.exemplars
+        .slice(0, specContext?.likelyNewFileExemplars?.length ? 8 : 3)
+        .map(exemplar => ({
+          kind: exemplar.kind,
+          file: exemplar.file,
+          nodeId: exemplar.nodeId,
+          plannedFile: exemplar.plannedFile,
+          provenance: exemplar.provenance,
+          confidence: exemplar.confidence,
+          shapeMatchConfidence: exemplar.shapeMatchConfidence,
+          coMentionConfidence: exemplar.coMentionConfidence,
+          reason: exemplar.reason.length > 180 ? `${exemplar.reason.slice(0, 177)}...` : exemplar.reason,
+        })),
     };
   }
 
@@ -2435,21 +2467,13 @@ export class Weave {
     const fileLimit = query.maxFiles ?? 10;
     const exemplarLimit = query.maxExemplars ?? 8;
     const referenceLimit = Math.max(12, Math.min(24, fileLimit * 2));
-    const edgeSummaryLimit = Math.min(fileLimit, 8);
-    const edgeLimit = 2;
 
     return {
       ...specContext,
       referencedFiles: specContext.referencedFiles.slice(0, referenceLimit),
       lineReferences: specContext.lineReferences?.slice(0, fileLimit),
       lineAnchoredQueries: specContext.lineAnchoredQueries?.slice(0, fileLimit),
-      existingFileEdges: specContext.existingFileEdges
-        ?.slice(0, edgeSummaryLimit)
-        .map(summary => ({
-          ...summary,
-          edges: summary.edges.slice(0, edgeLimit),
-          omittedEdges: summary.omittedEdges ?? Math.max(0, (summary.totalEdges ?? summary.edges.length) - Math.min(edgeLimit, summary.edges.length)),
-        })),
+      existingFileEdges: undefined,
       existingFiles: specContext.existingFiles.slice(0, fileLimit),
       existingTargets: specContext.existingTargets?.slice(0, fileLimit),
       missingFiles: specContext.missingFiles.slice(0, referenceLimit),
@@ -2459,13 +2483,50 @@ export class Weave {
       // This is the implementation manifest. Do not silently truncate it:
       // omitted planned files look like Weave has no opinion, which is exactly
       // the failure mode bootstrap is supposed to prevent.
-      likelyNewFileExemplars: specContext.likelyNewFileExemplars,
-      plannedFilePatterns: specContext.plannedFilePatterns?.slice(0, exemplarLimit),
+      likelyNewFileExemplars: this.compactPlannedFileExemplars(specContext.likelyNewFileExemplars ?? []),
+      plannedFilePatterns: this.compactPlannedFilePatterns(specContext.plannedFilePatterns ?? [], exemplarLimit),
       suspiciousReferences: specContext.suspiciousReferences.slice(0, referenceLimit),
       novelPathPrefixes: specContext.novelPathPrefixes.slice(0, fileLimit),
-      terms: specContext.terms?.slice(0, 24),
+      terms: undefined,
       termIndex: undefined,
     };
+  }
+
+  private compactPlannedFileExemplars(
+    exemplars: BootstrapPlannedFileExemplar[],
+  ): BootstrapPlannedFileExemplar[] {
+    return exemplars.map(exemplar => ({
+      file: exemplar.file,
+      kind: exemplar.kind,
+      exemplarFile: exemplar.exemplarFile,
+      exemplarNodeId: exemplar.exemplarNodeId,
+      reason: exemplar.exemplarFile
+        ? 'shape-bounded exemplar'
+        : 'no indexed exemplar',
+      confidence: exemplar.confidence,
+      coMentionConfidence: exemplar.coMentionConfidence,
+      shapeMatchConfidence: exemplar.shapeMatchConfidence,
+    }));
+  }
+
+  private compactPlannedFilePatterns(
+    patterns: BootstrapPlannedFilePattern[],
+    limit: number,
+  ): BootstrapPlannedFilePattern[] {
+    return patterns
+      .slice(0, limit)
+      .map(pattern => ({
+        file: pattern.file,
+        kind: pattern.kind,
+        role: pattern.role,
+        status: pattern.status,
+        confidence: pattern.confidence,
+        directExemplarFile: pattern.directExemplarFile,
+        constructionPatterns: [],
+        configPatterns: [],
+        usageExamples: [],
+        notes: pattern.notes.slice(0, 2),
+      }));
   }
 
   private buildBootstrapPrompt(
@@ -2478,38 +2539,23 @@ export class Weave {
     specContext: BootstrapSpecContext | null = null,
     compact = false,
   ): string {
+    if (compact) {
+      return this.buildCompactBootstrapPrompt(
+        task,
+        start,
+        entryCandidates,
+        context,
+        guidance,
+        fallbackPolicy,
+        specContext,
+      );
+    }
+
     const omitGenericExemplars = Boolean(specContext?.likelyNewFileExemplars?.length);
     const promptContext = omitGenericExemplars
       ? { ...context, exemplars: [] }
       : context;
-    const contextPayload = compact
-      ? {
-	          workingSet: promptContext.workingSet.map(file => ({
-	            file: file.file,
-	            kind: file.kind,
-	            kinds: file.kinds,
-	            confidence: file.confidence,
-	            reasons: file.reasons.map(reason => reason.text),
-          })),
-          constraints: promptContext.constraints.map(constraint => ({
-            kind: constraint.kind,
-	            rule: constraint.rule,
-	            plugin: constraint.plugin,
-	            confidence: constraint.confidence,
-	            frequency: `${constraint.frequency}/${constraint.total}`,
-	          })),
-		          exemplars: promptContext.exemplars.map(exemplar => ({
-		            kind: exemplar.kind,
-		            file: exemplar.file,
-		            plannedFile: exemplar.plannedFile,
-		            confidence: exemplar.confidence,
-		            shapeMatchConfidence: exemplar.shapeMatchConfidence,
-		            coMentionConfidence: exemplar.coMentionConfidence,
-		            reason: exemplar.reason,
-		          })),
-          specDigest: specContext ? this.specContextDigest(specContext) : null,
-        }
-      : promptContext;
+    const contextPayload = promptContext;
 
     return [
       'You are operating in Weave-first mode.',
@@ -2577,8 +2623,48 @@ export class Weave {
       ...fallbackPolicy.map(item => `- ${item}`),
       '',
       'Context bundle:',
-      compact ? JSON.stringify(contextPayload) : JSON.stringify(contextPayload, null, 2),
+      JSON.stringify(contextPayload, null, 2),
     ].join('\n');
+  }
+
+  private buildCompactBootstrapPrompt(
+    task: string,
+    start: string,
+    entryCandidates: BootstrapEntryCandidate[],
+    context: ContextBundle,
+    guidance: string[],
+    fallbackPolicy: string[],
+    specContext: BootstrapSpecContext | null,
+  ): string {
+    const lines = [
+      'Weave bootstrap summary.',
+      `Task: ${task}`,
+      `Entry: ${start}`,
+    ];
+
+    if (specContext) {
+      lines.push(
+        `Spec: ${specContext.file}`,
+        `Digest: ${this.specContextDigest(specContext)}`,
+      );
+      const lineQueries = specContext.lineAnchoredQueries ?? [];
+      if (lineQueries.length > 0) {
+        lines.push(`Line anchors: ${lineQueries.slice(0, 4).map(query => query.query).join(', ')}`);
+      }
+      const exemplars = specContext.likelyNewFileExemplars ?? [];
+      if (exemplars.length > 0) {
+        lines.push(`Planned file exemplars: ${exemplars.length} entries in spec.likelyNewFileExemplars.`);
+      }
+    }
+
+    lines.push(
+      `Working set count: ${context.workingSet.length}`,
+      `Constraint count: ${context.constraints.length}`,
+      `Entry candidates: ${entryCandidates.map(candidate => `${candidate.file} ${Math.round(candidate.confidence * 100)}%`).join(', ')}`,
+      `Use top-level workingSet/constraints/exemplars. Widen only if fallback policy applies.`,
+    );
+
+    return lines.join('\n');
   }
 
   private buildSpecContext(specInput: string): BootstrapSpecContext {

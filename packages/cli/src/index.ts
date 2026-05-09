@@ -7,7 +7,7 @@ import { Weave } from '@weave/core';
 import type { FileIndexDiagnostics, PluginRuleDiagnostics, WeaveConfig, WeaveStatus } from '@weave/core';
 import { parse as parseYaml } from 'yaml';
 
-function loadConfig(projectRoot: string): Partial<WeaveConfig> {
+export function loadConfig(projectRoot: string): Partial<WeaveConfig> {
   const configPath = resolve(projectRoot, '.weave', 'config.yaml');
   if (!existsSync(configPath)) return {};
 

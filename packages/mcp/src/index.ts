@@ -1,7 +1,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { Weave } from '@weave/core';
-import type { WeaveConfig, WeaveStatus } from '@weave/core';
+import type { BootstrapQuery, SubgraphOptions, SubgraphQuery, WeaveConfig, WeaveStatus } from '@weave/core';
 import { z } from 'zod';
 import { readFileSync, existsSync } from 'node:fs';
 import { resolve, join } from 'node:path';
@@ -27,7 +27,7 @@ function loadConfig(root: string): Partial<WeaveConfig> {
   }
 }
 
-function jsonResult(data: unknown): { content: Array<{ type: 'text'; text: string }> } {
+export function jsonResult(data: unknown): { content: Array<{ type: 'text'; text: string }> } {
   return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
 }
 
@@ -36,7 +36,7 @@ function errorResult(error: unknown): { content: Array<{ type: 'text'; text: str
   return { content: [{ type: 'text', text: JSON.stringify({ error: message }) }], isError: true };
 }
 
-function summarizeStatus(projectRoot: string, status: WeaveStatus) {
+export function summarizeStatus(projectRoot: string, status: WeaveStatus) {
   const noisyFiles = status.diagnostics.files
     .filter(file => file.l2EdgesSkipped > 0 || file.l3EdgesSkipped > 0 || file.queryErrors > 0)
     .sort((a, b) =>
@@ -93,6 +93,109 @@ function summarizeStatus(projectRoot: string, status: WeaveStatus) {
   };
 }
 
+type ActiveSpec = { fromSpec?: string; fromSpecText?: string };
+
+interface QueryToolInput {
+  file: string;
+  scope?: string;
+  depth?: number;
+  lineStart?: number;
+  lineEnd?: number;
+  task?: string;
+  fromSpec?: string;
+  fromSpecText?: string;
+  maxTokens?: number;
+  includeConventions?: boolean;
+  includeExemplars?: boolean;
+  includeSnippets?: boolean;
+  includeSpecContext?: boolean;
+}
+
+interface BootstrapToolInput {
+  file?: string;
+  task: string;
+  fromSpec?: string;
+  fromSpecText?: string;
+  scope?: string;
+  compact?: boolean;
+  depth?: number;
+  maxFiles?: number;
+  maxConstraints?: number;
+  maxExemplars?: number;
+}
+
+interface ImpactToolInput {
+  fileOrSymbol: string;
+  summary?: boolean;
+  lineStart?: number;
+  lineEnd?: number;
+  task?: string;
+  scope?: string;
+  fromSpec?: string;
+  fromSpecText?: string;
+  maxTokens?: number;
+  maxNodes?: number;
+  maxEdges?: number;
+  includeSpecContext?: boolean;
+}
+
+function resolveSpec(input: ActiveSpec, activeSpec: ActiveSpec): ActiveSpec {
+  return input.fromSpec || input.fromSpecText ? input : activeSpec;
+}
+
+export function buildQueryRequest(input: QueryToolInput, activeSpec: ActiveSpec = {}): SubgraphQuery {
+  const spec = resolveSpec(input, activeSpec);
+  return {
+    start: input.file,
+    task: input.task,
+    scope: input.scope,
+    fromSpec: spec.fromSpec,
+    fromSpecText: spec.fromSpecText,
+    depth: input.depth,
+    options: {
+      includeConventions: input.includeConventions,
+      includeExemplars: input.includeExemplars,
+      includeSnippets: input.includeSnippets,
+      includeSpecContext: input.includeSpecContext ?? false,
+      lineStart: input.lineStart,
+      lineEnd: input.lineEnd,
+      maxTokens: input.maxTokens,
+    },
+  };
+}
+
+export function buildBootstrapRequest(input: BootstrapToolInput): BootstrapQuery {
+  return {
+    task: input.task,
+    start: input.file,
+    fromSpec: input.fromSpec,
+    fromSpecText: input.fromSpecText,
+    scope: input.scope,
+    compact: input.compact ?? true,
+    depth: input.depth,
+    maxFiles: input.maxFiles,
+    maxConstraints: input.maxConstraints,
+    maxExemplars: input.maxExemplars,
+  };
+}
+
+export function buildImpactOptions(input: ImpactToolInput, activeSpec: ActiveSpec = {}): SubgraphOptions {
+  const spec = resolveSpec(input, activeSpec);
+  return {
+    summary: input.summary,
+    lineStart: input.lineStart,
+    lineEnd: input.lineEnd,
+    task: input.task,
+    scope: input.scope,
+    fromSpec: spec.fromSpec,
+    fromSpecText: spec.fromSpecText,
+    maxTokens: input.maxTokens,
+    maxNodes: input.maxNodes,
+    maxEdges: input.maxEdges,
+    includeSpecContext: input.includeSpecContext ?? false,
+  };
+}
+
 function createRuntime(projectRootArg?: string) {
   const projectRoot = resolveProjectRoot(projectRootArg);
   const config = loadConfig(projectRoot);
@@ -146,27 +249,26 @@ export function createServer(projectRootArg?: string): McpServer {
       includeConventions: z.boolean().optional().describe('Include derived conventions'),
       includeExemplars: z.boolean().optional().describe('Include exemplar references'),
       includeSnippets: z.boolean().optional().describe('Include code snippets'),
+      includeSpecContext: z.boolean().optional().describe('Include summarized active spec context; defaults to false to avoid repeated bootstrap payloads'),
     },
-    async ({ file, scope, depth, lineStart, lineEnd, task, fromSpec, fromSpecText, maxTokens, includeConventions, includeExemplars, includeSnippets }) => {
+    async ({ file, scope, depth, lineStart, lineEnd, task, fromSpec, fromSpecText, maxTokens, includeConventions, includeExemplars, includeSnippets, includeSpecContext }) => {
       try {
         await runtime.ensureReady();
-        const spec = fromSpec || fromSpecText ? { fromSpec, fromSpecText } : runtime.activeSpec();
-        const result = runtime.weave.query({
-          start: file,
-          task,
+        const result = runtime.weave.query(buildQueryRequest({
+          file,
           scope,
-          fromSpec: spec.fromSpec,
-          fromSpecText: spec.fromSpecText,
           depth,
-          options: {
-            includeConventions,
-            includeExemplars,
-            includeSnippets,
-            lineStart,
-            lineEnd,
-            maxTokens,
-          },
-        });
+          lineStart,
+          lineEnd,
+          task,
+          fromSpec,
+          fromSpecText,
+          maxTokens,
+          includeConventions,
+          includeExemplars,
+          includeSnippets,
+          includeSpecContext,
+        }, runtime.activeSpec()));
         return jsonResult(result);
       } catch (error) {
         return errorResult(error);
@@ -226,18 +328,18 @@ export function createServer(projectRootArg?: string): McpServer {
     async ({ file, task, fromSpec, fromSpecText, scope, compact, depth, maxFiles, maxConstraints, maxExemplars }) => {
       try {
         await runtime.ensureReady();
-        const result = runtime.weave.bootstrap({
+        const result = runtime.weave.bootstrap(buildBootstrapRequest({
           task,
-          start: file,
+          file,
           fromSpec,
           fromSpecText,
           scope,
-          compact: compact ?? true,
+          compact,
           depth,
           maxFiles,
           maxConstraints,
           maxExemplars,
-        });
+        }));
         if (fromSpec || fromSpecText) {
           runtime.setActiveSpec({ fromSpec, fromSpecText });
         } else if (result.spec?.file && result.spec.file !== '<inline-spec>') {
@@ -326,23 +428,25 @@ export function createServer(projectRootArg?: string): McpServer {
       maxTokens: z.number().int().positive().optional().describe('Approximate token budget used to derive maxNodes/maxEdges'),
       maxNodes: z.number().int().positive().optional().describe('Maximum cross-file nodes to include'),
       maxEdges: z.number().int().positive().optional().describe('Maximum impact edges to include'),
+      includeSpecContext: z.boolean().optional().describe('Include summarized active spec context; defaults to false to avoid repeated bootstrap payloads'),
     },
-    async ({ fileOrSymbol, summary, lineStart, lineEnd, task, scope, fromSpec, fromSpecText, maxTokens, maxNodes, maxEdges }) => {
+    async ({ fileOrSymbol, summary, lineStart, lineEnd, task, scope, fromSpec, fromSpecText, maxTokens, maxNodes, maxEdges, includeSpecContext }) => {
       try {
         await runtime.ensureReady();
-        const spec = fromSpec || fromSpecText ? { fromSpec, fromSpecText } : runtime.activeSpec();
-        const result = runtime.weave.impact(fileOrSymbol, {
+        const result = runtime.weave.impact(fileOrSymbol, buildImpactOptions({
+          fileOrSymbol,
           summary,
           lineStart,
           lineEnd,
           task,
           scope,
-          fromSpec: spec.fromSpec,
-          fromSpecText: spec.fromSpecText,
+          fromSpec,
+          fromSpecText,
           maxTokens,
           maxNodes,
           maxEdges,
-        });
+          includeSpecContext,
+        }, runtime.activeSpec()));
         return jsonResult(result);
       } catch (error) {
         return errorResult(error);

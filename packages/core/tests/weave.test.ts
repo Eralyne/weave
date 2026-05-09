@@ -1612,7 +1612,16 @@ class SyncHooksCommand extends Command
           file: expect.any(String),
         }),
       ]));
-      expect(Buffer.byteLength(JSON.stringify(payload))).toBeLessThan(Buffer.byteLength(JSON.stringify(verbosePayload)));
+      const compactBytes = Buffer.byteLength(JSON.stringify(payload));
+      const verboseBytes = Buffer.byteLength(JSON.stringify(verbosePayload));
+      expect(compactBytes).toBeLessThan(verboseBytes);
+      expect(compactBytes).toBeLessThan(20_000);
+      expect(JSON.parse(JSON.stringify(payload))).toEqual(expect.objectContaining({
+        workingSet: expect.any(Array),
+        constraints: expect.any(Array),
+        exemplars: expect.any(Array),
+      }));
+      expect(JSON.parse(JSON.stringify(payload))).not.toHaveProperty('context');
 
       expect(payload.spec).toEqual(expect.objectContaining({
         file: 'docs/LORE_FEATURE_DESIGN.md',
@@ -1694,7 +1703,7 @@ class SyncHooksCommand extends Command
           query: 'resources/js/Pages/Orders/Status.vue:4-5',
         }),
       ]));
-      expect(payload.spec?.existingFileEdges).toEqual(expect.arrayContaining([
+      expect(verbosePayload.spec?.existingFileEdges).toEqual(expect.arrayContaining([
         expect.objectContaining({
           file: 'app/Actions/Orders/ShowOrderStatusAction.php',
           edges: expect.arrayContaining([
@@ -1717,7 +1726,7 @@ class SyncHooksCommand extends Command
           ]),
         }),
       ]));
-      expect(payload.spec?.likelyNewFileExemplars).toEqual(expect.arrayContaining([
+      expect(verbosePayload.spec?.likelyNewFileExemplars).toEqual(expect.arrayContaining([
         expect.objectContaining({
           file: 'app/Services/LoreRegistry.php',
           kind: 'service',
@@ -1735,7 +1744,7 @@ class SyncHooksCommand extends Command
           confidence: 0.35,
         }),
       ]));
-      expect(payload.spec?.plannedFilePatterns).toEqual(expect.arrayContaining([
+      expect(verbosePayload.spec?.plannedFilePatterns).toEqual(expect.arrayContaining([
         expect.objectContaining({
           file: 'app/Services/LoreRegistry.php',
           kind: 'service',
@@ -1873,6 +1882,19 @@ class SyncHooksCommand extends Command
           }),
         }),
       ]));
+      const plannedFiles = payload.spec?.plannedFiles ?? [];
+      const plannedFilesWithExemplars = new Set((payload.spec?.likelyNewFileExemplars ?? []).map(exemplar => exemplar.file));
+      const plannedEvidenceGaps = new Set(
+        (((payload.warnings ?? []).find(warning => warning.code === 'planned_file_evidence_gaps')?.details?.gaps ?? []) as Array<{ file: string }>)
+          .map(gap => gap.file),
+      );
+      expect(plannedFiles.length).toBeGreaterThan(0);
+      for (const file of plannedFiles) {
+        expect(
+          plannedFilesWithExemplars.has(file) || plannedEvidenceGaps.has(file),
+          `${file} should have an exemplar or an explicit evidence-gap warning`,
+        ).toBe(true);
+      }
       expect(payload.context.workingSet.every(file => file.reasons.length > 0)).toBe(true);
       expect(payload.context.workingSet.find(file =>
         file.file === 'routes/web.php'
@@ -1907,12 +1929,12 @@ class SyncHooksCommand extends Command
         }),
       ]));
       expect(compactPayload.spec?.existingFiles.length).toBeLessThanOrEqual(6);
-      expect(compactPayload.prompt).toContain('Generic context exemplars omitted from this prompt');
+      expect(compactPayload.prompt).toContain('spec.likelyNewFileExemplars');
       expect(compactPayload.context.workingSet.every(file =>
         file.reasons.length <= 3 && file.anchors.length <= 2
       )).toBe(true);
 
-      expect(payload.spec?.likelyNewFileExemplars).toEqual(expect.arrayContaining([
+      expect(verbosePayload.spec?.likelyNewFileExemplars).toEqual(expect.arrayContaining([
         expect.objectContaining({
           file: 'resources/js/Components/Lore/LoreText.vue',
           exemplarFile: 'resources/js/Components/UI/InfoTooltip.vue',

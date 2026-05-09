@@ -115,6 +115,7 @@ export interface SubgraphOptions {
   summary?: boolean;
   maxNodes?: number;
   maxEdges?: number;
+  includeSpecContext?: boolean;
   task?: string;
   scope?: string;
   fromSpec?: string;
