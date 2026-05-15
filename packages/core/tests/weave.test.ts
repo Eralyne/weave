@@ -1467,6 +1467,189 @@ test('notification settings smoke test', function () {
   return projectRoot;
 }
 
+function createFrontendContractMigrationProject(): string {
+  const projectRoot = mkdtempSync(join(tmpdir(), 'weave-contract-migration-'));
+
+  mkdirSync(join(projectRoot, 'app/Actions/Combat'), { recursive: true });
+  mkdirSync(join(projectRoot, 'app/Clients'), { recursive: true });
+  mkdirSync(join(projectRoot, 'app/Http/Requests'), { recursive: true });
+  mkdirSync(join(projectRoot, 'resources/js/Components'), { recursive: true });
+  mkdirSync(join(projectRoot, 'resources/js/Pages/Campaign'), { recursive: true });
+  mkdirSync(join(projectRoot, 'resources/js/composables'), { recursive: true });
+  mkdirSync(join(projectRoot, 'resources/js/composables/__tests__'), { recursive: true });
+  mkdirSync(join(projectRoot, 'resources/js/lang'), { recursive: true });
+  mkdirSync(join(projectRoot, 'resources/js/types'), { recursive: true });
+
+  writeFileSync(join(projectRoot, 'artisan'), '#!/usr/bin/env php\n');
+  writeFileSync(
+    join(projectRoot, 'composer.json'),
+    JSON.stringify({
+      require: {
+        'laravel/framework': '^11.0',
+        'lorisleiva/laravel-actions': '^2.0',
+      },
+    }, null, 2),
+  );
+  writeFileSync(
+    join(projectRoot, 'package.json'),
+    JSON.stringify({
+      dependencies: {
+        vue: '^3.0.0',
+      },
+    }, null, 2),
+  );
+  writeFileSync(
+    join(projectRoot, 'app/Actions/Combat/CombatEndTurnAction.php'),
+    `<?php
+
+use Lorisleiva\\Actions\\Concerns\\AsAction;
+
+class CombatEndTurnAction
+{
+    use AsAction;
+}
+`,
+  );
+  writeFileSync(
+    join(projectRoot, 'app/Http/Requests/CombatEndTurnRequest.php'),
+    `<?php
+
+class CombatEndTurnRequest
+{
+}
+`,
+  );
+  writeFileSync(
+    join(projectRoot, 'app/Clients/GameEngineClient.php'),
+    `<?php
+
+class GameEngineClient
+{
+    public function withCanonicalLocation(array $payload): array
+    {
+        return $payload;
+    }
+}
+`,
+  );
+  writeFileSync(
+    join(projectRoot, 'resources/js/Pages/Campaign/Turns.vue'),
+    `<script setup>
+import { useCombatStateMapper } from '@/composables/useCombatStateMapper'
+import { useLocality } from '@/composables/useLocality'
+import { useTurnResume } from '@/composables/useTurnResume'
+
+const mapper = useCombatStateMapper()
+const locality = useLocality()
+const resume = useTurnResume()
+</script>
+
+<template>
+  <LocationHeader :current-location="locality.currentLocation" />
+  <aside>
+    <li v-for="npc in sidebar.npcs" :key="npc.id">{{ npc.name }}</li>
+  </aside>
+</template>
+`,
+  );
+  writeFileSync(
+    join(projectRoot, 'resources/js/composables/useCombatStateMapper.ts'),
+    `export function useCombatStateMapper() {
+  function mapState(payload) {
+    return payload.scene_roster ?? payload.visible_npcs
+  }
+
+  return { mapState }
+}
+`,
+  );
+  writeFileSync(
+    join(projectRoot, 'resources/js/composables/useLocality.ts'),
+    `export function useLocality() {
+  const currentLocation = {
+    current_location: 'forest',
+    display_location: 'Forest',
+    world_view: 'surface',
+  }
+
+  return { currentLocation }
+}
+`,
+  );
+  writeFileSync(
+    join(projectRoot, 'resources/js/composables/useTurnResume.ts'),
+    `export function useTurnResume() {
+  return { decision_payload_resolved: true }
+}
+`,
+  );
+  writeFileSync(
+    join(projectRoot, 'resources/js/composables/__tests__/useTurnResume.test.ts'),
+    `import { describe, expect, it } from 'vitest'
+
+describe('turn resume', () => {
+  it('posts to turns and keeps visible_npcs compatible', () => {
+    expect('/turns').toContain('turns')
+    expect('visible_npcs').toBe('visible_npcs')
+  })
+})
+`,
+  );
+  writeFileSync(
+    join(projectRoot, 'resources/js/composables/__tests__/useCharacterCreation.test.ts'),
+    `import { describe, expect, it } from 'vitest'
+
+describe('character creation', () => {
+  it('mentions world view copy incidentally', () => {
+    expect('world_view').toBeTruthy()
+  })
+})
+`,
+  );
+  writeFileSync(
+    join(projectRoot, 'resources/js/Components/DebugPanel.vue'),
+    `<template>
+  <pre>{{ visible_npcs }}</pre>
+</template>
+`,
+  );
+  writeFileSync(
+    join(projectRoot, 'resources/js/Components/LocationHeader.vue'),
+    `<script setup>
+defineProps({ currentLocation: Object })
+
+function buildSceneSubtitle(location) {
+  return location.display_location ?? location.current_location ?? location.world_view
+}
+</script>
+
+<template>
+  <header>{{ buildSceneSubtitle(currentLocation) }}</header>
+</template>
+`,
+  );
+  writeFileSync(
+    join(projectRoot, 'resources/js/lang/en.ts'),
+    `export default {
+  sidebar: {
+    npcs: 'NPCs',
+  },
+}
+`,
+  );
+  writeFileSync(
+    join(projectRoot, 'resources/js/types/api.ts'),
+    `export interface TurnPayload {
+  visible_npcs?: unknown[]
+  scene_roster?: unknown[]
+  decision_payload_resolved?: boolean
+}
+`,
+  );
+
+  return projectRoot;
+}
+
 const createdProjects: string[] = [];
 
 afterEach(() => {
@@ -1546,6 +1729,72 @@ class SyncHooksCommand extends Command
           details: expect.objectContaining({
             targetSymbol: 'console.warn',
           }),
+        }),
+      ]));
+    } finally {
+      weave.close();
+    }
+  });
+
+  it('traces non-spec frontend contract terms into concrete implementation files', async () => {
+    const projectRoot = createFrontendContractMigrationProject();
+    createdProjects.push(projectRoot);
+
+    const weave = new Weave(projectRoot);
+    try {
+      await weave.init();
+
+      const payload = weave.bootstrap({
+        task: 'Frontend Vue WorldView display rule. GameEngineClient is background context only. Replace visible_npcs with scene_roster, update sidebar.npcs, current_location, display_location, world_view, buildSceneSubtitle, LocationHeader, currentLocation, DebugPanel.vue, lang/en.ts, Turns.vue, useLocality, useCombatStateMapper, useTurnResume, and useTurnResume.test.ts.',
+        maxEntryCandidates: 8,
+        maxFiles: 10,
+        maxConstraints: 6,
+        maxExemplars: 4,
+      });
+      const workingFiles = payload.workingSet.map(file => file.file);
+
+      expect(payload.entryCandidates[0]?.file).toMatch(/^resources\/js\//);
+      expect(payload.entryCandidates[0]?.file).not.toContain('__tests__');
+      expect(payload.entryCandidates.map(candidate => candidate.file)).not.toContain('app/Clients/GameEngineClient.php');
+      expect(payload.entryCandidates.map(candidate => candidate.file)).not.toContain('resources/js/composables/__tests__/useCharacterCreation.test.ts');
+      expect(payload.entryCandidates.some(candidate =>
+        candidate.reasons.some(reason => reason.startsWith('task contract term "visible_npcs"')),
+      )).toBe(true);
+      expect(workingFiles).toEqual(expect.arrayContaining([
+        'resources/js/Pages/Campaign/Turns.vue',
+        'resources/js/composables/useCombatStateMapper.ts',
+        'resources/js/composables/useLocality.ts',
+        'resources/js/composables/useTurnResume.ts',
+        'resources/js/Components/DebugPanel.vue',
+        'resources/js/Components/LocationHeader.vue',
+        'resources/js/lang/en.ts',
+        'resources/js/types/api.ts',
+      ]));
+      expect(workingFiles).not.toContain('app/Http/Requests/CombatEndTurnRequest.php');
+      expect(workingFiles).not.toContain('app/Clients/GameEngineClient.php');
+      expect(workingFiles.indexOf('resources/js/composables/__tests__/useTurnResume.test.ts')).toBeGreaterThan(
+        workingFiles.indexOf('resources/js/Pages/Campaign/Turns.vue'),
+      );
+      expect(payload.constraints.map(constraint => constraint.kind)).not.toEqual(expect.arrayContaining([
+        'action',
+        'model',
+        'form_request',
+      ]));
+      expect(payload.exemplars.map(exemplar => exemplar.file)).not.toEqual(expect.arrayContaining([
+        expect.stringMatching(/^app\//),
+      ]));
+      const validation = weave.validateWithSummary([
+        'resources/js/Pages/Campaign/Turns.vue',
+        'resources/js/types/api.ts',
+      ]);
+      expect(validation.evidenceGaps).not.toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          file: 'resources/js/Pages/Campaign/Turns.vue',
+          reason: 'no_indexed_nodes',
+        }),
+        expect.objectContaining({
+          file: 'resources/js/types/api.ts',
+          reason: 'unknown_kind',
         }),
       ]));
     } finally {

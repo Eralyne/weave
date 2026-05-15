@@ -432,6 +432,7 @@ export class SymbolExtractor {
     }
 
     this.ensureComposableFileNode(filePath, source, lang, nodes);
+    this.ensureTypeContractFileNode(filePath, source, lang, nodes);
 
     return { nodes, edges };
   }
@@ -456,6 +457,33 @@ export class SymbolExtractor {
       filePath,
       symbolName,
       kind: 'composable',
+      language,
+      lineStart: 1,
+      lineEnd: Math.max(1, source.split('\n').length),
+      signature: null,
+      metadata: { fileLevel: true },
+    });
+  }
+
+  private ensureTypeContractFileNode(
+    filePath: string,
+    source: string,
+    language: string,
+    nodes: Partial<WeaveNode>[],
+  ): void {
+    const normalizedPath = filePath.replace(/\\/g, '/');
+    if (!/^resources\/js\/types\//.test(normalizedPath)) {
+      return;
+    }
+    const symbolName = basename(filePath, extname(filePath));
+    if (nodes.some(node => node.kind === 'type_contract')) {
+      return;
+    }
+
+    nodes.unshift({
+      filePath,
+      symbolName,
+      kind: 'type_contract',
       language,
       lineStart: 1,
       lineEnd: Math.max(1, source.split('\n').length),

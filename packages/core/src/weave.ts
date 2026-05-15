@@ -53,12 +53,21 @@ import type {
 type TaskMode = 'implementation' | 'audit_communication' | 'audit_architecture';
 type TaskFocus = 'frontend' | 'backend' | 'mixed' | 'tests';
 type ContextProvenance = ContextReason['provenance'];
+type ContractTermKind = 'quoted' | 'path' | 'member' | 'identifier';
+
+interface ContractTerm {
+  value: string;
+  kind: ContractTermKind;
+  source: 'task';
+  matcher: 'literal';
+}
 
 interface TaskProfile {
   mode: TaskMode;
   focus: TaskFocus;
   prefersTests: boolean;
   terms: string[];
+  contractTerms: ContractTerm[];
   endpointLiterals: string[];
   specContext: BootstrapSpecContext | null;
   creationLike: boolean;
@@ -1902,6 +1911,7 @@ export class Weave {
       if (options.includeSpecContextEntries !== false) {
         this.addSpecContextFiles(fileEntries, taskProfile);
       }
+      this.addContractTermContextFiles(fileEntries, taskProfile);
       this.addEndpointLiteralContextFiles(fileEntries, taskProfile);
       this.addFrontendImplementationContextFiles(fileEntries, taskProfile, primaryStart);
       this.addHeuristicContextFiles(fileEntries, taskProfile, primaryStart);
@@ -1926,6 +1936,7 @@ export class Weave {
           reason.text.includes('renders_child')
           || reason.text.includes('uses_composable')
           || reason.text.startsWith('imported by ')
+          || reason.text.startsWith('task contract term ')
           || reason.text.includes('endpoint')
           || reason.text.includes('HTTP client')
           || reason.text.includes('route table'),
@@ -1958,7 +1969,8 @@ export class Weave {
         || Array.from(entry.reasons.values()).some(reason =>
           reason.text.includes('endpoint')
           || reason.text.includes('HTTP client')
-          || reason.text.includes('route table'),
+          || reason.text.includes('route table')
+          || reason.text.startsWith('task contract term '),
         )
         || entry.score >= scoreFloor,
       );
@@ -2077,6 +2089,9 @@ export class Weave {
     for (const [kind, node] of nodeByKind) {
       const exemplar = this.conventionEngine.getExemplar(kind, node.id);
       if (!exemplar || workingFiles.has(exemplar.file) || this.isGeneratedPath(exemplar.file)) {
+        continue;
+      }
+      if (taskProfile && this.isLowValuePrecedent(exemplar.file, taskProfile.terms)) {
         continue;
       }
 
@@ -2451,6 +2466,18 @@ export class Weave {
       return Array.from(availableKinds)
         .sort((a, b) => this.auditBundleKindPriority(b) - this.auditBundleKindPriority(a) || a.localeCompare(b))
         .slice(0, 7);
+    }
+
+    if (taskProfile?.mode === 'implementation' && taskProfile.focus === 'frontend') {
+      const frontendKinds: string[] = [];
+      for (const kind of ['inertia_page', 'component', 'composable']) {
+        if (availableKinds.has(kind)) {
+          frontendKinds.push(kind);
+        }
+      }
+      if (frontendKinds.length > 0) {
+        return frontendKinds;
+      }
     }
 
     const preferredKinds: string[] = [];
@@ -2982,6 +3009,7 @@ export class Weave {
     if (filePath.startsWith('resources/js/Pages/') && filePath.endsWith('.vue')) return 'inertia_page';
     if (filePath.startsWith('resources/js/Components/') && filePath.endsWith('.vue')) return 'component';
     if (filePath.startsWith('resources/js/composables/') && /\/use[A-Z].*\.(?:js|ts)$/.test(filePath)) return 'composable';
+    if (filePath.startsWith('resources/js/types/') && /\.(?:ts|tsx|js|jsx)$/.test(filePath)) return 'type_contract';
     if (filePath.startsWith('routes/')) return 'route_definition';
     if (filePath.endsWith('.md')) return 'spec';
     return null;
@@ -3019,6 +3047,8 @@ export class Weave {
         return 55;
       case 'composable':
         return 58;
+      case 'type_contract':
+        return 56;
       case 'export':
         return 52;
       case 'spec':
@@ -4948,6 +4978,77 @@ export class Weave {
       .filter(term => !stopwords.has(term));
   }
 
+  /**
+   * First-pass contract tracing is deliberately literal and explainable.
+   * Future AST-backed extractors should emit ContractTerm records into this
+   * pipeline instead of adding one-off task-specific matching rules.
+   */
+  private extractContractTerms(task: string): ContractTerm[] {
+    const terms = new Map<string, ContractTerm>();
+    const add = (value: string | undefined, kind: ContractTermKind) => {
+      if (!value) {
+        return;
+      }
+      const normalized = this.normalizeContractTerm(value);
+      if (!normalized || normalized.length < 3) {
+        return;
+      }
+      if (this.isLowSignalContractTerm(normalized)) {
+        return;
+      }
+      const existing = terms.get(normalized);
+      if (!existing || kind === 'quoted') {
+        terms.set(normalized, {
+          value: normalized,
+          kind,
+          source: 'task',
+          matcher: 'literal',
+        });
+      }
+    };
+
+    for (const match of task.matchAll(/`([^`]+)`/g)) {
+      add(match[1], 'quoted');
+    }
+
+    for (const match of task.matchAll(/\b[A-Za-z_$][A-Za-z0-9_$]*(?:[._/-][A-Za-z0-9_$-]+)+\b/g)) {
+      const value = match[0];
+      add(value, value.includes('/') || this.looksLikeFileLikeContractTerm(value) ? 'path' : 'member');
+    }
+
+    for (const match of task.matchAll(/\b[A-Za-z_$][A-Za-z0-9_$]*[A-Z][A-Za-z0-9_$]*\b/g)) {
+      add(match[0], 'identifier');
+    }
+
+    return Array.from(terms.values());
+  }
+
+  private normalizeContractTerm(value: string): string | null {
+    const normalized = value
+      .trim()
+      .replace(/^['"`]+|['"`.,;:!?]+$/g, '')
+      .replace(/^\$+/, '');
+    if (!normalized || /^https?:\/\//i.test(normalized)) {
+      return null;
+    }
+    return normalized;
+  }
+
+  private isLowSignalContractTerm(value: string): boolean {
+    const lower = value.toLowerCase();
+    if (/^(?:true|false|null|undefined|return|const|let|var|function|class|type|interface)$/.test(lower)) {
+      return true;
+    }
+    if (/^\d+$/.test(value)) {
+      return true;
+    }
+    return false;
+  }
+
+  private looksLikeFileLikeContractTerm(value: string): boolean {
+    return /\.(?:php|vue|js|ts|tsx|jsx|css|scss|json|ya?ml|md|sql)$/i.test(value);
+  }
+
   private normalizeTaskTerm(term: string): string {
     if (term.length > 4 && term.endsWith('ies')) {
       return `${term.slice(0, -3)}y`;
@@ -4995,8 +5096,19 @@ export class Weave {
     return this.searchTokensForText(base).has(term);
   }
 
-  private taskPrefersTests(terms: string[]): boolean {
-    return terms.some(term => ['test', 'tests', 'spec', 'specs', 'coverage', 'assert'].includes(term));
+  private taskPrefersTests(task: string, terms: string[]): boolean {
+    const lowerTask = this.stripEndpointLiterals(task).toLowerCase();
+    if (/\b(?:phpunit|pest|vitest|jest|pytest|rspec|coverage)\b/.test(lowerTask)) {
+      return true;
+    }
+    if (/\b(?:add|write|create|update|fix|repair|adjust|cover|assert|verify)\s+(?:unit\s+|feature\s+|integration\s+|e2e\s+)?tests?\b/.test(lowerTask)) {
+      return true;
+    }
+    if (/\btests?\s+(?:for|around|covering|that|should|fail|fails|failing)\b/.test(lowerTask)) {
+      return true;
+    }
+
+    return terms.some(term => ['coverage', 'assert'].includes(term));
   }
 
   private inferTaskMode(task: string, prefersTests: boolean): TaskMode {
@@ -5069,7 +5181,8 @@ export class Weave {
     specContext: BootstrapSpecContext | null = null,
   ): TaskProfile {
     const baseTerms = this.extractTaskTerms(task);
-    const prefersTests = this.taskPrefersTests(baseTerms);
+    const contractTerms = this.extractContractTerms(task);
+    const prefersTests = this.taskPrefersTests(task, baseTerms);
     const mode = this.inferTaskMode(task, prefersTests);
     const endpointLiterals = this.extractEndpointLiterals(task);
     const expandedTerms = this.expandTaskTerms(baseTerms, task, mode);
@@ -5082,6 +5195,7 @@ export class Weave {
       focus: mode === 'audit_communication' ? 'mixed' : this.inferTaskFocus(task, prefersTests),
       prefersTests,
       terms,
+      contractTerms,
       endpointLiterals,
       specContext,
       creationLike: /\b(add|build|create|implement|introduce|scaffold|wire|new)\b/.test(lowerTask),
@@ -5298,6 +5412,11 @@ export class Weave {
       add(candidate);
     }
 
+    const contractCandidates = this.inferContractTermCandidates(taskProfile, maxCandidates * 2);
+    for (const candidate of contractCandidates) {
+      add(candidate);
+    }
+
     const frontendBridgeCandidates = this.inferFrontendBridgeCandidates(
       Array.from(merged.values()),
       taskProfile,
@@ -5363,6 +5482,9 @@ export class Weave {
     if (candidate.reasons.some(reason => reason.startsWith('task term '))) {
       score += 12;
     }
+    if (candidate.reasons.some(reason => reason.startsWith('task contract term '))) {
+      score += 34;
+    }
     if (candidate.reasons.some(reason => reason.startsWith('weak fallback:'))) {
       score -= 80;
     }
@@ -5390,15 +5512,29 @@ export class Weave {
     const providedStart = query.start ? this.toRelativePath(query.start) : null;
     const preferred = candidates.filter(candidate =>
       candidate.file === providedStart
-      || !(
-        candidate.file.startsWith('app/Actions/')
-        || candidate.file.startsWith('routes/')
-        || candidate.file.startsWith('app/Models/')
-        || candidate.file.startsWith('app/Http/')
-      ),
+      || this.isFrontendImplementationCandidate(candidate.file, taskProfile),
     );
 
-    return preferred.length > 0 ? preferred : candidates;
+    const focusFiltered = preferred.length > 0 ? preferred : candidates;
+    if (taskProfile.prefersTests) {
+      return focusFiltered;
+    }
+
+    const nonTestCandidates = focusFiltered.filter(candidate => !this.isTestLikePath(candidate.file));
+    return nonTestCandidates.length > 0 ? nonTestCandidates : focusFiltered;
+  }
+
+  private isFrontendImplementationCandidate(file: string, taskProfile: TaskProfile): boolean {
+    if (this.isTestLikePath(file)) {
+      return taskProfile.prefersTests;
+    }
+    return file.startsWith('resources/js/')
+      || file.startsWith('resources/css/')
+      || file.startsWith('public/');
+  }
+
+  private isTestLikePath(file: string): boolean {
+    return isTestFilePath(file) || /(?:^|\/)__tests__\//.test(file);
   }
 
   private inferImpactAdjacentCandidates(
@@ -5584,6 +5720,130 @@ export class Weave {
     }
 
     return combined.slice(0, maxCandidates);
+  }
+
+  private inferContractTermCandidates(
+    taskProfile: TaskProfile,
+    maxCandidates: number,
+  ): BootstrapEntryCandidate[] {
+    if (taskProfile.contractTerms.length === 0) {
+      return [];
+    }
+
+    const scored = this.scoreContractTermFiles(taskProfile);
+    const sorted = Array.from(scored.entries())
+      .filter(([, entry]) => entry.score > 0)
+      .sort((a, b) => b[1].score - a[1].score || a[0].localeCompare(b[0]))
+      .slice(0, maxCandidates);
+
+    const maxScore = sorted[0]?.[1].score ?? 1;
+    return sorted.map(([file, entry]) => ({
+      file,
+      confidence: Math.max(0.68, Math.min(0.98, entry.score / maxScore)),
+      reasons: Array.from(entry.reasons).slice(0, 4),
+    }));
+  }
+
+  private scoreContractTermFiles(taskProfile: TaskProfile): Map<string, { score: number; reasons: Set<string> }> {
+    const scored = new Map<string, { score: number; reasons: Set<string> }>();
+    const files = this.indexedProjectFiles()
+      .filter(file => this.isContractSearchableFile(file))
+      .filter(file => this.fileAllowedForTaskFocus(file, taskProfile));
+
+    for (const file of files) {
+      const content = this.readProjectTextFile(file) ?? '';
+      const lowerFile = file.toLowerCase();
+      const lowerContent = content.toLowerCase();
+      for (const term of taskProfile.contractTerms) {
+        const lowerTerm = term.value.toLowerCase();
+        let score = 0;
+        if (lowerFile.includes(lowerTerm)) {
+          score += term.kind === 'path' || term.kind === 'quoted' ? 180 : 80;
+        }
+        if (basename(lowerFile) === lowerTerm) {
+          score += 34;
+        }
+
+        const occurrences = this.countLiteralOccurrences(lowerContent, lowerTerm);
+        if (occurrences > 0) {
+          score += Math.min(120, occurrences * 32);
+        }
+
+        if (score <= 0) {
+          continue;
+        }
+
+        score += this.contractFileRoleWeight(file, taskProfile);
+        const entry = scored.get(file) ?? { score: 0, reasons: new Set<string>() };
+        entry.score += score;
+        entry.reasons.add(`task contract term "${term.value}" appears in ${lowerFile.includes(lowerTerm) ? 'path/source' : 'source'}`);
+        scored.set(file, entry);
+      }
+    }
+
+    return scored;
+  }
+
+  private isContractSearchableFile(file: string): boolean {
+    return /\.(php|js|ts|vue|tsx|jsx|css|scss|json|ya?ml)$/i.test(file)
+      && !file.includes('/node_modules/')
+      && !file.includes('/vendor/');
+  }
+
+  private fileAllowedForTaskFocus(file: string, taskProfile: TaskProfile): boolean {
+    if (taskProfile.focus === 'frontend') {
+      return file.startsWith('resources/js/')
+        || file.startsWith('resources/css/')
+        || file.startsWith('public/')
+        || this.isTestLikePath(file);
+    }
+    if (taskProfile.focus === 'backend') {
+      return !file.startsWith('resources/js/Components/')
+        && !file.startsWith('resources/js/Pages/');
+    }
+    return true;
+  }
+
+  private countLiteralOccurrences(value: string, needle: string): number {
+    if (!needle) {
+      return 0;
+    }
+    let count = 0;
+    let index = value.indexOf(needle);
+    while (index !== -1) {
+      count += 1;
+      index = value.indexOf(needle, index + needle.length);
+    }
+    return count;
+  }
+
+  private contractFileRoleWeight(file: string, taskProfile: TaskProfile): number {
+    let score = this.pathBootstrapWeight(
+      file,
+      taskProfile.prefersTests,
+      taskProfile.focus,
+      taskProfile.mode,
+      taskProfile.terms,
+    );
+    if (file.endsWith('.vue')) score += 12;
+    if (file.startsWith('resources/js/composables/')) score += 10;
+    if (/resources\/js\/(?:types|api|lang)\//.test(file) || /resources\/js\/(?:types|api|lang)\.[jt]s$/.test(file)) {
+      score += 10;
+    }
+    if (file.startsWith('resources/js/lang/') || /\/lang\//.test(file)) {
+      score += 8;
+    }
+    if (
+      this.isTestLikePath(file)
+      && !taskProfile.prefersTests
+      && !taskProfile.contractTerms.some(term =>
+        (term.kind === 'path' || term.kind === 'quoted')
+        && file.toLowerCase().includes(term.value.toLowerCase()),
+      )
+    ) {
+      score -= 180;
+    }
+    return score;
   }
 
   private contextFileTaskBonus(filePath: string, taskProfile: TaskProfile): number {
@@ -6497,6 +6757,39 @@ export class Weave {
           : candidate.file.startsWith('routes/')
             ? 110
             : 70;
+
+      for (const reason of candidate.reasons) {
+        entry.reasons.set(reason, {
+          text: reason,
+          provenance: 'task_heuristic',
+          confidence: candidate.confidence,
+        });
+      }
+    }
+  }
+
+  private addContractTermContextFiles(
+    fileEntries: Map<string, {
+      file: string;
+      kinds: Set<string>;
+      reasons: Map<string, ContextReason>;
+      anchors: SubgraphNode[];
+      score: number;
+      provenance: ContextProvenance;
+    }>,
+    taskProfile: TaskProfile,
+  ): void {
+    const candidates = this.inferContractTermCandidates(taskProfile, 12);
+    for (const candidate of candidates) {
+      const entry = this.getOrCreateFileEntry(fileEntries, candidate.file);
+      if (entry.provenance !== 'explicit_graph') {
+        entry.provenance = 'task_heuristic';
+      }
+      entry.kinds.add(this.primaryKindForFile(candidate.file));
+      entry.score += candidate.file.endsWith('.vue') ? 150 : 120;
+      if (candidate.file.startsWith('resources/js/lang/') || /\/lang\//.test(candidate.file)) {
+        entry.score += 28;
+      }
 
       for (const reason of candidate.reasons) {
         entry.reasons.set(reason, {

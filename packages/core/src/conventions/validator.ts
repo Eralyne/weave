@@ -182,6 +182,7 @@ export class ConventionValidator {
     if (filePath.startsWith('config/') && filePath.endsWith('.php')) return 'config_array';
     if (filePath.startsWith('app/Http/Requests/')) return 'form_request';
     if (isTestFilePath(filePath)) return 'test';
+    if (filePath.startsWith('resources/js/types/') && /\.(?:ts|tsx|js|jsx)$/.test(filePath)) return 'type_contract';
     if (filePath.startsWith('resources/js/Pages/') && filePath.endsWith('.vue')) return 'inertia_page';
     if (filePath.startsWith('resources/js/Components/') && filePath.endsWith('.vue')) return 'component';
     if (filePath.startsWith('resources/js/composables/') && /\/use[A-Z].*\.(?:js|ts)$/.test(filePath)) return 'composable';
@@ -249,6 +250,10 @@ export class ConventionValidator {
 
     if (inferredKind) {
       if (!indexedKinds.has(inferredKind)) {
+        if (inferredKind === 'inertia_page' && indexedKinds.has('component')) {
+          kindSet.add('component');
+          return this.evidenceGapsForKinds(filePath, kindSet);
+        }
         return [this.evidenceGap(filePath, inferredKind, 'no_indexed_nodes')];
       }
       kindSet.add(inferredKind);
@@ -264,6 +269,10 @@ export class ConventionValidator {
       return [this.evidenceGap(filePath, inferredKind, inferredKind ? 'no_indexed_nodes' : 'unknown_kind')];
     }
 
+    return this.evidenceGapsForKinds(filePath, kindSet);
+  }
+
+  private evidenceGapsForKinds(filePath: string, kindSet: Set<string>): ValidationEvidenceGap[] {
     const gaps: ValidationEvidenceGap[] = [];
     for (const kind of kindSet) {
       const conventions = this.engine.getConventions(kind);
@@ -287,6 +296,7 @@ export class ConventionValidator {
       'model',
       'service',
       'test',
+      'type_contract',
     ].includes(kind);
   }
 
